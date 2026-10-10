@@ -105,6 +105,14 @@ class Settings:
     #: 命中风控后的冷却时长（秒）。冷却期内**该账号**不建任务
     #:（其他账号的队列不受影响；在途任务继续轮询）。
     hl_cooldown: float = 600.0
+    #: 同步接口 `POST /v1/images/generations`（创建+轮询合并）的**总等待预算**（秒）：
+    #: 预算内到终态直接给结果；耗尽仍在跑 ⇒ 202 + task_id 无缝转异步轮询
+    #:（任务不取消，协调器继续推进）。图片实测最慢档 ~124s ⇒ 300s 足够覆盖。
+    sync_max_wait: float = 300.0
+    #: 同步端点的**并发等待上限**（信号量，进程内）。同步等待阻塞线程池线程
+    #:（anyio 默认 40）⇒ 用硬护栏把最坏占用钉死，槽满 **429 秒回**（带 Retry-After），
+    #: 绝不让慢请求把线程池吃光而殃及其他请求。8 = 常规号池场景绰绰有余。
+    sync_max_concurrency: int = 8
     #: 建任务的**提交重试上限**（仅用于"建任务之前"的瞬时失败：输入图下载/上传、
     #: 连接被掐）。这类失败**上游一定没有建任务** ⇒ 重试不会重复计费。
     #: 3 = 实测连接抖动在 1~2 次内收敛；超过 3 次说明不是抖动，判失败更诚实。
@@ -249,6 +257,8 @@ class Settings:
             hl_per_minute=_i("HL_PER_MINUTE", 0),
             hl_cooldown=_f("HL_COOLDOWN", 600.0),
             submit_max_attempts=_i("SUBMIT_MAX_ATTEMPTS", 3),
+            sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),
+            sync_max_concurrency=_i("SYNC_MAX_CONCURRENCY", 8),
             hailuo_poll_interval=_f("HAILUO_POLL_INTERVAL", 5.0),
             poll_grace=_f("POLL_GRACE", 0.5),
             task_timeout=_f("TASK_TIMEOUT", 900.0),
@@ -292,6 +302,10 @@ class Settings:
             raise ConfigError("SUBMIT_MAX_ATTEMPTS 必须 >= 1")
         if self.task_timeout <= 0:
             raise ConfigError("TASK_TIMEOUT 必须 > 0")
+        if self.sync_max_wait <= 0:
+            raise ConfigError("SYNC_MAX_WAIT 必须 > 0")
+        if self.sync_max_concurrency < 1:
+            raise ConfigError("SYNC_MAX_CONCURRENCY 必须 >= 1")
         if self.hailuo_poll_interval <= 0:
             raise ConfigError("HAILUO_POLL_INTERVAL 必须 > 0")
         if self.task_retention_days < 1:

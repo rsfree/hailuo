@@ -85,6 +85,10 @@ from .upstream.hailuo.client import (
 _RATIO_RE = re.compile(r"^(\d{1,3}):(\d{1,3})$")
 _SIZE_RE = re.compile(r"^(\d{2,5})\s*[x×*]\s*(\d{2,5})$")
 
+#: 同步接口（`POST /v1/images/generations`）等待终态时的**库轮询间隔**（秒）。
+#: 只读本地库、不打上游，取小让同步响应紧跟终态出现（实测终态写库后至多半拍延迟）。
+SYNC_WAIT_POLL_INTERVAL = 0.5
+
 #: 长边 → resolution 档。**这是本服务自己的口径**（上游只认 1K/2K/4K 这类枚举），
 #: 所以每次映射都进 `degradations`。
 _RES_BY_MAX_SIDE: tuple[tuple[int, str], ...] = ((1536, "1K"), (2560, "2K"))
@@ -1023,6 +1027,35 @@ class Service:
         if credential is not None and full.get("credential_id") != credential:
             raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
         return full
+
+    def wait_terminal(self, task_id: str, credential: str, *,
+                      max_wait: float) -> dict[str, Any]:
+        """在 `max_wait` 预算内等待任务到**终态**；超预算返回当时的记录（**不抛错**）。
+
+        🔴 这是同步接口（`POST /v1/images/generations`）的等待实现 ——
+        它**只查本地库**，从不直接驱动上游：任务的推进始终由协调器线程做
+        （建任务是计费动作，必须走队列与闸门），等待方只是把"调用方原本
+        要做的多次轮询"折叠进一个 HTTP 请求里。
+
+        预算耗尽不是错误、是降级信号：调用方按 `view()` 的 202 语义拿
+        `task_id` **无缝转异步轮询**；任务不会丢、也不会被取消（上游没有
+        取消端点，它本来就在继续跑）。
+
+        前提：有推进者在跑（`Coordinator.running`）—— HTTP 层在进来之前
+        已经断言过；没有推进者时等满预算也是白等，那里会快速 503。
+        """
+        t0 = time.monotonic()
+        deadline = t0 + max_wait
+        while True:
+            full = self.get_for_credential(task_id, credential)
+            remaining = deadline - time.monotonic()
+            if full["status"] in TERMINAL or remaining <= 0:
+                OBS.event("sync.wait_finished", task_id=task_id,
+                          status=full["status"],
+                          waited_s=round(time.monotonic() - t0, 3),
+                          timed_out=full["status"] not in TERMINAL)
+                return full
+            time.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
 
     def list_for_credential(self, credential: str, *, limit: int = 50) -> dict[str, Any]:
         """**只列自己的** —— 只按服务过滤会把别人的任务列给你。"""

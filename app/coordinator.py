@@ -84,6 +84,11 @@ class Coordinator:
 
     # ------------------------------------------------------------------ 生命周期
 
+    @property
+    def running(self) -> bool:
+        """推进者是否**真的活着**（配置只说明意图，线程活着才算数）。"""
+        return bool(self._thread and self._thread.is_alive())
+
     def start(self) -> None:
         if not self.settings.coordinator_enabled:
             logger.warning("协调器已按配置关闭（COORDINATOR_ENABLED=0）—— "

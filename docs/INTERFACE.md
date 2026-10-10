@@ -297,6 +297,32 @@ GET /async/v1/images/generations/{task_id}
 
 ---
 
+## 5.5 同步出图（`POST /v1/images/generations`）
+
+创建 + 轮询合并进**一个请求**，预算内直接给最终结果（与异步族同一受理链路、
+同一 `view()` 出口、同一队列与闸门 —— 只是替调用方做了等待）：
+
+| 情形 | 响应 |
+|---|---|
+| 预算内到终态 | 成功 **200** `{data, created, usage}`；失败 **200** `{task_id, status: "failure", error}` |
+| 预算耗尽仍在跑 | **202** `{task_id, status}` + `Location: /async/v1/images/generations/{id}` —— 无缝转异步轮询，任务不丢不取消 |
+| 协调器没在跑 | **503** `sync_unavailable`（快速失败，不让调用方白等） |
+| 同步等待槽满 | **429** `sync_busy` + `Retry-After`（并发护栏，秒回不占线程） |
+
+· 等待预算 `SYNC_MAX_WAIT`（默认 300s；图片实测最慢档 ~124s ⇒ 足够覆盖）；
+· 并发护栏 `SYNC_MAX_CONCURRENCY`（默认 8）：同步等待阻塞的是线程池线程，
+  护栏把最坏占用钉死在有限线程上，**槽满秒回，绝不拖累其他请求**；
+· 等待期间**不发任何上游请求**（只读本地库；推进是协调器线程的职责）。
+
+```bash
+curl -sS https://hailuo.1task.cn/v1/images/generations \
+  -H "Authorization: Bearer <hailuo JWT>" -H "Content-Type: application/json" \
+  -d '{"model":"nano-banana","prompt":"a cat"}'
+# ⇒ 200 {"data":[{"url":"https://cdn.hailuoai.video/…"}],"created":…,"usage":{…}}
+```
+
+---
+
 ## 6. 错误信封
 
 ```json
@@ -312,6 +338,8 @@ GET /async/v1/images/generations/{task_id}
 | `invalid_api_key` | 401 | 调用方的 Key 不对 |
 | `task_not_found` | 404 | 不存在或不属于本 Key |
 | `upstream_rate_limited` | 429 | 上游限流，**可退避重试**（带 `Retry-After`） |
+| `sync_unavailable` | 503 | 协调器没在跑 ⇒ 同步端点不可用，改走异步端点 |
+| `sync_busy` | 429 | 同步等待槽满（护栏秒回），稍后重试或改走异步端点（带 `Retry-After`） |
 | `upstream_quota_exhausted` | 429 | 额度/积分耗尽，**重试无效** |
 | `risk_control_challenge` | 429 | 命中风控，**重试会延长标记**，服务已进入冷却 |
 | `upstream_error` | 502 | 上游 5xx / 非 JSON / WAF 页 |

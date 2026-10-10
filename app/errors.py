@@ -157,6 +157,32 @@ class CredentialUnavailable(AdapterError):
     error_type = "service_unavailable"
 
 
+class SyncUnavailable(AdapterError):
+    """同步端点没有任务推进者（协调器线程没在跑，如 COORDINATOR_ENABLED=0）。
+
+    **快速 503** 而不是让调用方白等一整个预算 —— 那种部署形态下任务根本
+    不会被推进，同步等待等满预算也是白等。
+    """
+
+    status_code = 503
+    code = "sync_unavailable"
+    error_type = "service_unavailable"
+
+
+class SyncBusy(AdapterError):
+    """同步等待槽位已满（并发护栏，`SYNC_MAX_CONCURRENCY`）。
+
+    推进者活着、服务没坏 —— 只是当前同步等待数到了上限。**429 + `Retry-After`**
+    秒回（不等预算），调用方退避重试或改走异步端点。护栏的意义：同步等待
+    阻塞的是线程池线程（默认 40 个），不设上限的话大量慢请求会把线程池吃光，
+    **殃及同进程其他同步路径** —— 槽满秒回把最坏情况钉死在有限线程上。
+    """
+
+    status_code = 429
+    code = "sync_busy"
+    error_type = "rate_limit_error"
+
+
 class CapabilityUnavailable(AdapterError):
     """能力当前不可用（如上游能力表读不到且无冻结快照）。"""
 

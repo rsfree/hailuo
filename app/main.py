@@ -20,6 +20,7 @@ GET    /async/v1/models                     能力清单（OpenAI 形态 + 上�
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -34,7 +35,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import models
 from .config import Settings
 from .coordinator import Coordinator
-from .errors import AdapterError, AuthError, InvalidParameterError
+from .errors import (
+    AdapterError,
+    AuthError,
+    InvalidParameterError,
+    SyncBusy,
+    SyncUnavailable,
+)
 from .observability import OBS, excluded_urls, is_probe_path, setup_logging, should_log_path
 from .seedance_api import install_video_routes
 from .service import Service, view
@@ -178,6 +185,9 @@ def create_app(settings: Settings | None = None,
     app.state.settings = settings
     app.state.service = service
     app.state.coordinator = Coordinator(service, settings)
+    #: 同步端点的并发护栏：进程内信号量，槽满 429 秒回（见 SyncBusy docstring）。
+    #: 挂在 app.state（而非模块级）⇒ 多 app 实例（测试）互不串扰。
+    app.state.sync_slots = threading.BoundedSemaphore(settings.sync_max_concurrency)
 
     #: **视频**链路（火山 Seedance 协议出口）。与图片**同一进程、另一张表**。
     #: 测试里 `service` 是注入的桩 ⇒ 这里跟着用同一套依赖，避免它去摸真实网络。
@@ -301,6 +311,61 @@ def _install_routes(app: FastAPI) -> None:
         return JSONResponse(
             status_code=202, content={"task_id": rec["task_id"]},
             headers={"Location": f"/async/v1/images/generations/{rec['task_id']}"})
+
+    # ------------------------------------------- 同步生成（创建+轮询合并）
+    @app.post("/v1/images/generations")
+    def create_generation_sync(
+        request: Request,
+        body: GenerationRequest,
+        credential: str = Depends(require_key),
+    ) -> JSONResponse:
+        """**同步**出图：创建 + 轮询合并进一个请求，预算内直接给最终结果。
+
+        ⚠️ 刻意用 `def` 而**不是** `async def`：本函数会阻塞等待至多
+        `SYNC_MAX_WAIT` 秒（默认 300）—— 在 `async def` 里这样等会卡死整个
+        事件循环（同 worker 的其它请求全部排队）。FastAPI 会把同步端点丢进
+        线程池执行，阻塞因而只影响这一个请求。**改动签名前先想清这一点。**
+
+        语义（与异步族共用同一判定，`view()` 仍是唯一出口）：
+          · 预算内到终态 → 直接回终态体（成功 200；失败 200 + `status: failure`）；
+          · 预算耗尽仍在跑 → **202 + `task_id`** + `Location` 指向异步查询端点
+            —— 调用方无缝转异步轮询；任务不会丢、也不会被取消；
+          · 没有推进者（协调器线程没在跑）→ **503**（`sync_unavailable`）快速
+            失败，而不是让调用方白等 —— 那种部署形态下任务根本不会被推进。
+
+        内部链路与异步受理完全一致：落库 → 叫醒协调器 → 等库里的状态变化。
+        等待期间**不发任何上游请求**（推进是协调器线程的职责，这里只读库）。
+        """
+        settings: Settings = request.app.state.settings
+        coordinator = request.app.state.coordinator
+        if not coordinator.running:
+            raise SyncUnavailable(
+                "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
+                "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
+                "或开启协调器后重试。")
+        slots: threading.BoundedSemaphore = request.app.state.sync_slots
+        if not slots.acquire(blocking=False):
+            #: 🔴 性能护栏：槽满 **429 秒回**（带 Retry-After），绝不排队等线程 ——
+            #: 同步等待阻塞的是线程池线程，最坏占用被钉死在 SYNC_MAX_CONCURRENCY。
+            raise SyncBusy(
+                f"同步等待并发已达上限（{settings.sync_max_concurrency}）。"
+                "请稍后重试（带 Retry-After），或改用异步端点 "
+                "POST /async/v1/images/generations + GET 轮询。",
+                retry_after=1.0)
+        try:
+            svc: Service = request.app.state.service
+            rec = svc.create(body.model_dump(), credential=credential)
+            coordinator.wake()
+            rec = svc.wait_terminal(rec["task_id"], credential,
+                                    max_wait=settings.sync_max_wait)
+        finally:
+            slots.release()
+        status_code, payload = view(rec)
+        headers: dict[str, str] = {}
+        if status_code == 202:
+            #: 预算耗尽 ⇒ 把异步轮询的入口直接递给调用方（无缝降级）
+            headers["Location"] = f"/async/v1/images/generations/{rec['task_id']}"
+        return JSONResponse(status_code=status_code, content=payload, headers=headers)
 
     # ------------------------------------------------------------- 查询单条
     @app.get("/async/v1/images/generations/{task_id}")

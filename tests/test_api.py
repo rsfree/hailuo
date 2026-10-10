@@ -248,3 +248,92 @@ def test_probe_paths_are_not_logged_but_others_are() -> None:
     assert is_probe_path("/healthz") and is_probe_path("/readyz")
     assert not should_log_path("/healthz")
     assert should_log_path("/async/v1/images/generations")
+
+
+# ---------------------------------------------------------------------------
+# 同步接口（/v1/images/generations —— 创建+轮询合并）
+# ---------------------------------------------------------------------------
+
+
+def test_sync_endpoint_503_without_coordinator(client) -> None:
+    """没有推进者（协调器线程没起）⇒ **503 快速失败**，不让调用方白等一整个预算。
+
+    测试环境的 client 不跑 lifespan ⇒ 协调器线程天然没起，正好覆盖这条路径。
+    """
+    r = client.post("/v1/images/generations", json={"prompt": "x"}, headers=KEY)
+    assert r.status_code == 503
+    err = r.json()["error"]
+    assert err["code"] == "sync_unavailable"
+    assert err["type"] == "service_unavailable"
+
+
+def test_sync_endpoint_returns_final_result(client, service, fake, monkeypatch) -> None:
+    """预算内到终态 ⇒ **200 + data**（与异步终态同形状，view() 唯一出口）。
+
+    推进由后台 feeder 线程做（等任务出现在 due_for_submit 就 submit+poll）——
+    同步端点本身只读库等待，这正是"推进是协调器职责"的镜像。
+    """
+    import threading
+    import time as _time
+
+    from app.coordinator import Coordinator
+
+    monkeypatch.setattr(Coordinator, "running", property(lambda self: True))
+    monkeypatch.setattr(service.settings, "sync_max_wait", 8.0)
+
+    def feeder() -> None:
+        deadline = _time.time() + 6
+        while _time.time() < deadline:
+            rows = service.store.due_for_submit(limit=1)
+            if rows:
+                service.submit(rows[0]["task_id"])
+                service.poll_many(service.store.in_flight())
+                return
+            _time.sleep(0.05)
+
+    t = threading.Thread(target=feeder, daemon=True)
+    t.start()
+    r = client.post("/v1/images/generations", json={"prompt": "a cat"}, headers=KEY)
+    t.join(timeout=8)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"data", "created", "usage"}
+    assert body["data"][0]["url"].startswith("https://")
+
+
+def test_sync_endpoint_429_when_slots_exhausted(client, service, monkeypatch) -> None:
+    """并发护栏：同步等待槽满 ⇒ **429 + Retry-After 秒回**，绝不排队占线程。
+
+    性能红线：同步等待阻塞的是线程池线程（anyio 默认 40），护栏把最坏占用
+    钉死在 SYNC_MAX_CONCURRENCY —— 大量慢请求不能殃及其他请求。
+    """
+    import threading
+
+    from app.coordinator import Coordinator
+
+    monkeypatch.setattr(Coordinator, "running", property(lambda self: True))
+    #: 容量 1 且已占 ⇒ 请求必然撞护栏（与 settings 无关，直接换护栏对象）
+    client.app.state.sync_slots = threading.BoundedSemaphore(1)
+    assert client.app.state.sync_slots.acquire(blocking=False)
+
+    r = client.post("/v1/images/generations", json={"prompt": "x"}, headers=KEY)
+    assert r.status_code == 429
+    err = r.json()["error"]
+    assert err["code"] == "sync_busy"
+    assert err["type"] == "rate_limit_error"
+    assert r.headers.get("Retry-After") == "1"
+
+
+def test_sync_endpoint_202_falls_back_to_async(client, service, monkeypatch) -> None:
+    """预算耗尽仍在跑 ⇒ **202 + task_id + Location**（无缝转异步轮询，任务不丢）。"""
+    from app.coordinator import Coordinator
+
+    monkeypatch.setattr(Coordinator, "running", property(lambda self: True))
+    monkeypatch.setattr(service.settings, "sync_max_wait", 0.5)
+
+    r = client.post("/v1/images/generations", json={"prompt": "x"}, headers=KEY)
+    assert r.status_code == 202
+    body = r.json()
+    assert set(body) == {"task_id", "status"}
+    assert body["status"] == ST_QUEUED
+    assert r.headers["Location"] == f"/async/v1/images/generations/{body['task_id']}"
