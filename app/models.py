@@ -324,6 +324,8 @@ for _cap in CAPABILITIES:
 #: 拼写本就一致的无需别名）。注意 `nano-banana-2`（flash，多一个连字符）与
 #: `nano-banana2`（pro）只差一个 `-` —— 这是上游的命名，别"纠正"它。
 MODEL_ALIASES: dict[str, str] = {
+    #: `nano-banana`（无后缀）⇒ flash：调用方（newapi）的默认短名，落最快档
+    "nano-banana": "nano_banana21_flash",
     "nano-banana-2": "nano_banana21_flash",
     "nano-banana-pro": "nano-banana2",
     "midjourney-v7": "mj_v7",

@@ -131,7 +131,6 @@ def install_video_routes(app: FastAPI) -> None:
                 "task_id": r["task_id"], "status": r["status"],
                 "request": {}, "plan": {},
                 "result": {}, "error": {},
-                "degradations": r.get("degradations") or [],
                 "created_at": r.get("created_at"), "updated_at": r.get("updated_at"),
             })
             items.append(payload)

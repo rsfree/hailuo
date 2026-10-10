@@ -91,9 +91,8 @@ def test_get_success_returns_data_created_usage(client, service, fake) -> None:
     r = client.get(f"/async/v1/images/generations/{task_id}", headers=KEY)
     assert r.status_code == 200
     body = r.json()
-    # 契约三件套必须齐（`degradations` 是本服务的加性扩展，**仅非空时出现**）
-    assert {"data", "created", "usage"} <= set(body)
-    assert set(body) <= {"data", "created", "usage", "degradations"}
+    # 契约三件套必须齐；降级说明**不进响应**（2026-10-10 起只进日志与任务库）
+    assert set(body) == {"data", "created", "usage"}
     assert body["data"][0]["url"].startswith("https://")
     assert isinstance(body["created"], int) and body["created"] > 0
     assert body["usage"]["images"] == 1

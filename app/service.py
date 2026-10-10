@@ -38,6 +38,7 @@ import hashlib
 import hmac
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ from .errors import (
     AdapterError,
     CapabilityUnavailable,
     InvalidParameterError,
+    RiskControlChallenge,
     TaskNotDeletable,
     TaskNotFoundError,
     CredentialUnavailable,
@@ -207,6 +209,13 @@ class Service:
             connect_timeout=settings.task_db_connect_timeout,
         )
         self.gate: Gate = build_gate(settings)
+        #: 🔴 **多账号（号池）模式**：并发槽位、提交节奏、风控冷却都按**凭据（账号）**
+        #: 隔离 —— 账号 A 命中风控冷却不能停掉账号 B 的队列；`HL_CONCURRENCY` /
+        #: `HL_MIN_INTERVAL` / `HL_PER_MINUTE` 的语义因此是"**每账号**"
+        #: （总并发 = N 账号 × 参数值）。`self.gate` 保留为**默认闸门**：
+        #: 匿名/无凭据场景与观测兜底用。
+        self._gates: dict[str, Gate] = {}
+        self._gates_lock = threading.Lock()
         self._client = client
         self._uploader = uploader
         #: 🔴 **透传凭据池**（AUTH_MODE=jwt）：指纹 → (token, 惰性客户端)。
@@ -276,6 +285,27 @@ class Service:
                 "明文凭据不落库，重启后无法恢复 —— 请用同一 token 重新提交任务；"
                 "若任务已建到上游，可用该账号在 hailuo 侧查看原批次。")
         return pair
+
+    def gate_for(self, credential_id: str | None) -> Gate:
+        """取**该账号**的节奏闸门（惰性创建，每个凭据指纹一把）。
+
+        `credential_id` 为空（匿名/嵌入）⇒ 回落默认闸门 `self.gate`。
+        闸门是进程内状态：多**副本**仍会把限速整体放大（见 gate.py 模块注释），
+        但同进程内的多**账号**彼此隔离 —— 这是 newapi 号池模式的前提。
+        """
+        if not credential_id:
+            return self.gate
+        with self._gates_lock:
+            gate = self._gates.get(credential_id)
+            if gate is None:
+                gate = build_gate(self.settings)
+                self._gates[credential_id] = gate
+            return gate
+
+    def gates_snapshot(self) -> dict[str, dict[str, Any]]:
+        """全部**每账号**闸门的状态快照（观测用）。键 = 凭据指纹（不可逆哈希）。"""
+        with self._gates_lock:
+            return {cred: g.stats() for cred, g in self._gates.items()}
 
     def register_credential(self, token: str) -> str:
         """校验并登记一个**透传凭据**，返回凭证指纹。
@@ -368,6 +398,10 @@ class Service:
         logger.bind(task_id=rec["task_id"], capability=capability).info(
             f"已受理：{capability} model={upstream_model} "
             f"n={plan.quantity} images={len(plan.image_urls)}")
+        #: 🔴 降级说明**只进日志与任务库，不出现在 HTTP 响应**（2026-10-10
+        #: 接口字段收敛：调用方不消费该字段，排查以这里打出的日志为准）。
+        for note in plan.degradations:
+            logger.bind(task_id=rec["task_id"]).info(f"降级留痕：{note}")
         return rec
 
     # ------------------------------------------------------------------ 翻译层
@@ -682,7 +716,9 @@ class Service:
         plan = full["plan"] or {}
         self.store.update_task(task_id, attempts=(full.get("attempts") or 0) + 1)
 
-        decision = self.gate.check()
+        #: 🔴 用**本任务所属账号**的闸门（多账号隔离，见 `gate_for`）
+        gate = self.gate_for(full.get("credential_id"))
+        decision = gate.check()
         if not decision.allowed:
             logger.bind(task_id=task_id).debug(f"闸门拦截：{decision.reason}")
             return {"submitted": False, "reason": decision.reason}
@@ -714,6 +750,7 @@ class Service:
                 for uploaded, norm_notes, traces in results:
                     for note in norm_notes:
                         self.store.add_degradation(task_id, note)
+                        logger.bind(task_id=task_id).info(f"归一化留痕：{note}")
                     for t in traces:
                         OBS.upstream(f"upload.{t.get('stage')}", task_id=task_id, **t)
                     file_list.append(uploaded.to_file_list_entry())
@@ -742,7 +779,7 @@ class Service:
             return {"submitted": False, "dry_run": True, "trace": trace,
                     "file_list": file_list}
 
-        self.gate.note_submit()
+        gate.note_submit()
         self.store.update_task(
             task_id, status=ST_IN_PROGRESS, upstream_batch_id=batch_id,
             submitted_at=time.time())
@@ -798,7 +835,20 @@ class Service:
                 out["failed_no_credential"] = out.get("failed_no_credential", 0) + len(group)
                 logger.warning(f"凭据不可用 ⇒ {len(group)} 个任务判失败：{e}")
                 continue
-            res = self._poll_group(group, client=client, dry_run=dry_run)
+            try:
+                res = self._poll_group(group, client=client, dry_run=dry_run)
+            except RiskControlChallenge as e:
+                #: 🔴 多账号：轮询风控只冷却**该账号**（进它自己的闸门）——
+                #: 旧行为是全局冷却，一个账号命中风控会把所有账号的在途轮询全停掉。
+                self.gate_for(credential).enter_cooldown(str(e))
+                logger.warning(f"轮询命中风控，账号 {credential[:12]}… 进入冷却：{e}")
+                out["risk_control_groups"] = out.get("risk_control_groups", 0) + 1
+                continue
+            except AdapterError as e:
+                #: 单账号的轮询失败只跳过它自己那组（各有各的上游账号），其他账号继续。
+                logger.warning(f"轮询失败（跳过该账号组，其余不受影响）：{e}")
+                out["poll_error_groups"] = out.get("poll_error_groups", 0) + 1
+                continue
             for key, value in res.items():
                 if isinstance(value, int):
                     out[key] = out.get(key, 0) + value
@@ -1004,6 +1054,8 @@ class Service:
             "credentials": self.credentials.stats(),
             "concurrency_limit": self.settings.hl_concurrency,
             "gate": self.gate.stats(),
+            #: 每账号闸门（多账号号池）；键 = 凭据指纹（不可逆哈希，非秘密）
+            "gates": self.gates_snapshot(),
             "store": self.store.stats(),
             "capabilities": {**models.status(),
                              "degradations": self._caps_degradations,
@@ -1028,17 +1080,15 @@ def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     ⚠️ **失败也回 200**：任务本身完成了（只是结果是失败），请求没出错。
     回 4xx 会误触发调用方的重试逻辑。
 
-    `degradations` 仅在非空时出现（本服务的加性扩展）。
+    降级说明**不出现在响应里**（2026-10-10 接口字段收敛）：留痕只进
+    **服务日志**（受理时 `降级留痕：…` / 提交时 `归一化留痕：…`，带 task_id）
+    与任务库 `degradations_json` —— 调用方（newapi 号池）不消费该字段。
     """
     task_id = record["task_id"]
     status = record["status"]
-    degradations = record.get("degradations") or []
 
     if status not in TERMINAL:
-        body: dict[str, Any] = {"task_id": task_id, "status": status}
-        if degradations:
-            body["degradations"] = degradations
-        return 202, body
+        return 202, {"task_id": task_id, "status": status}
 
     if status == ST_SUCCEEDED:
         result = record.get("result") or {}
@@ -1049,23 +1099,17 @@ def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if forecast is not None:
             #: 🔴 明说是**预估**：来自上游计价表，不是账单实扣值。
             usage["forecast_credits"] = forecast
-        body = {
+        return 200, {
             "data": [{"url": d["url"]} for d in data],
             "created": int(result.get("created") or record.get("finished_at") or 0),
             "usage": usage,
         }
-        if degradations:
-            body["degradations"] = degradations
-        return 200, body
 
     error = record.get("error") or {
         "message": "任务失败（上游未给出原因）。", "type": "upstream_error",
         "code": "task_failed",
     }
-    body = {"task_id": task_id, "status": "failure", "error": error}
-    if degradations:
-        body["degradations"] = degradations
-    return 200, body
+    return 200, {"task_id": task_id, "status": "failure", "error": error}
 
 
 # ---------------------------------------------------------------------------

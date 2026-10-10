@@ -172,8 +172,10 @@ class Coordinator:
                 self.stats.polled_batches += 1
                 self.stats.advanced += int(res.get("updated") or 0)
             except RiskControlChallenge as e:
+                #: 兜底路径：`poll_many` 内部已按**账号**冷却（进各自闸门）；
+                #: 只有它没消化就整体抛出的异常（如测试 mock）才会落到这，进默认闸门。
                 self.service.gate.enter_cooldown(str(e))
-                logger.warning(f"轮询命中风控，已进入冷却：{e}")
+                logger.warning(f"轮询命中风控（兜底冷却）：{e}")
             except AdapterError as e:
                 self.stats.last_error = f"{type(e).__name__}: {e}"
                 logger.warning(f"轮询失败（不影响下一轮）：{e}")
@@ -201,47 +203,69 @@ class Coordinator:
         return self.stats
 
     def _submit_due(self) -> None:
-        slots = self.settings.hl_concurrency - self.service.store.count_active()
-        if slots <= 0:
+        """从 `queued` 里建任务。🔴 计费动作，受槽位 + 闸门约束。
+
+        🔴 **多账号（号池）**：并发槽位与节奏闸门按**凭据（账号）**隔离 ——
+        每个账号的队列独立推进（组内仍按 created_at 全局 FIFO）：
+
+        · 槽位 = `HL_CONCURRENCY` − **该账号**在途数（旧语义是全局总数）；
+        · 闸门是该账号自己的 `Gate`（`HL_MIN_INTERVAL`/`HL_PER_MINUTE` 按账号生效）；
+        · 命中风控 ⇒ 只冷却**该账号**，其他账号的队列不受影响；
+        · 某账号没槽位/闸门未放行 ⇒ 只跳过**该账号**，不拖累其他账号。
+
+        这样 newapi 号池接入 N 个账号，就是 N 条互不拖累的队列。
+        """
+        queued = self.service.store.due_for_submit(limit=200)
+        if not queued:
             return
-        for task in self.service.store.due_for_submit(limit=slots):
-            decision = self.service.gate.check()
-            if not decision.allowed:
-                self.stats.submit_skipped += 1
-                logger.debug(f"闸门未放行，本轮停止建任务：{decision.reason}")
-                return
-            try:
-                res = self.service.submit(task["task_id"])
-            except RiskControlChallenge as e:
-                self.service.gate.enter_cooldown(str(e))
-                self.stats.submit_failed += 1
-                logger.warning(f"建任务命中风控，整体冷却：{e}")
-                return
-            except AdapterError as e:
-                self.stats.submit_failed += 1
-                self.stats.last_error = f"{type(e).__name__}: {e}"
-                # 🔴 **建任务之前的失败**（输入图下载/上传、连接被掐）：
-                # 上游**一定没有**建任务 ⇒ 重试不会重复计费。任务保持 `queued`，
-                # 下一 tick 自然会被 `due_for_submit` 捞出重试（attempts 已由
-                # `service.submit` 自增，到上限就判失败——不能让任务无限重试）。
-                # 其余失败（已发出建任务请求等）**绝不重试**：无法排除上游已受理。
-                attempts_done = int(task.get("attempts") or 0) + 1
-                if (getattr(e, "pre_create", False)
-                        and attempts_done < self.settings.submit_max_attempts):
-                    logger.warning(
-                        f"建任务在**建任务前**失败（未计费），"
-                        f"第 {attempts_done}/{self.settings.submit_max_attempts} 次，"
-                        f"下一 tick 重试：{e}")
-                    continue
-                self.service.store.update_task(
-                    task["task_id"], status="failure", finished_at=time.time(),
-                    error={"message": str(e), "type": e.error_type, "code": e.code})
-                logger.warning(f"建任务失败（已判任务失败）：{e}")
+        active = self.service.store.active_counts_by_credential()
+        by_credential: dict[str, list[dict[str, Any]]] = {}
+        for task in queued:
+            by_credential.setdefault(task.get("credential_id") or "", []).append(task)
+
+        for credential, group in by_credential.items():
+            slots = self.settings.hl_concurrency - active.get(credential, 0)
+            if slots <= 0:
                 continue
-            if res.get("submitted"):
-                self.stats.submitted += 1
-            else:
-                self.stats.submit_skipped += 1
+            gate = self.service.gate_for(credential)
+            for task in group[:max(0, slots)]:
+                decision = gate.check()
+                if not decision.allowed:
+                    self.stats.submit_skipped += 1
+                    logger.debug(f"账号 {credential[:12]}… 闸门未放行，本轮跳过该账号：{decision.reason}")
+                    break
+                try:
+                    res = self.service.submit(task["task_id"])
+                except RiskControlChallenge as e:
+                    gate.enter_cooldown(str(e))
+                    self.stats.submit_failed += 1
+                    logger.warning(f"建任务命中风控，账号 {credential[:12]}… 整体冷却：{e}")
+                    break
+                except AdapterError as e:
+                    self.stats.submit_failed += 1
+                    self.stats.last_error = f"{type(e).__name__}: {e}"
+                    # 🔴 **建任务之前的失败**（输入图下载/上传、连接被掐）：
+                    # 上游**一定没有**建任务 ⇒ 重试不会重复计费。任务保持 `queued`，
+                    # 下一 tick 自然会被 `due_for_submit` 捞出重试（attempts 已由
+                    # `service.submit` 自增，到上限就判失败——不能让任务无限重试）。
+                    # 其余失败（已发出建任务请求等）**绝不重试**：无法排除上游已受理。
+                    attempts_done = int(task.get("attempts") or 0) + 1
+                    if (getattr(e, "pre_create", False)
+                            and attempts_done < self.settings.submit_max_attempts):
+                        logger.warning(
+                            f"建任务在**建任务前**失败（未计费），"
+                            f"第 {attempts_done}/{self.settings.submit_max_attempts} 次，"
+                            f"下一 tick 重试：{e}")
+                        continue
+                    self.service.store.update_task(
+                        task["task_id"], status="failure", finished_at=time.time(),
+                        error={"message": str(e), "type": e.error_type, "code": e.code})
+                    logger.warning(f"建任务失败（已判任务失败）：{e}")
+                    continue
+                if res.get("submitted"):
+                    self.stats.submitted += 1
+                else:
+                    self.stats.submit_skipped += 1
 
     # ------------------------------------------------------------------ 观测
 

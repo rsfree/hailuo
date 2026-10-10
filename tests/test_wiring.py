@@ -373,8 +373,8 @@ def test_coordinator_skips_work_when_not_leader(service, fake) -> None:
 def test_coordinator_gate_stops_submission(service, fake) -> None:
     from app.coordinator import Coordinator
 
-    service.gate.min_interval = 9999.0
-    service.gate.note_submit()
+    service.gate_for("c").min_interval = 9999.0
+    service.gate_for("c").note_submit()
     service.create({"prompt": "x"}, credential="c")
     coord = Coordinator(service, service.settings)
     coord.tick()
@@ -470,7 +470,7 @@ def test_coordinator_keeps_task_queued_on_risk_control(service, fake) -> None:
     coord.tick()
     assert service.store.get_full(rec["task_id"])["status"] == ST_QUEUED, \
         "风控不该把任务判死"
-    assert service.gate.in_cooldown, "风控必须触发冷却（重试会延长标记）"
+    assert service.gate_for("c").in_cooldown, "风控必须触发冷却（重试会延长标记）"
 
 
 def test_poll_grace_defers_just_submitted_tasks(service, fake) -> None:
@@ -578,6 +578,8 @@ def test_model_aliases_resolve_to_canonical_ids() -> None:
     🔴 `nano-banana-2`（flash）与 `nano-banana2`（pro）**只差一个连字符** ——
     上游就这么命名的，别名表必须一字不差。
     """
+    assert models.canonical_model_id("nano-banana") == "nano_banana21_flash", \
+        "裸 nano-banana ⇒ flash（newapi 默认短名，2026-10-10 加）"
     assert models.canonical_model_id("nano-banana-2") == "nano_banana21_flash"
     assert models.canonical_model_id("nano-banana-pro") == "nano-banana2"
     assert models.canonical_model_id("midjourney-v7") == "mj_v7"
@@ -673,3 +675,44 @@ def test_app_factory_is_importable_by_gunicorn() -> None:
     mod = importlib.import_module("app.main")
     assert callable(mod.create_app)
     assert callable(mod.app_factory)
+
+
+def test_multi_account_queues_are_isolated(service, fake) -> None:
+    """🔴 号池模式的核心前提：**每账号队列隔离**。
+
+    · A 在途满额 ⇒ 只有 A 的后续任务排队，B 照常提交（旧实现是全局一个队列，
+      B 会被 A 挤掉——这正是 newapi 号池接入前必须改掉的行为）；
+    · A 闸门冷却 ⇒ 只停 A，B 的队列照常推进。
+    """
+    from app.coordinator import Coordinator
+
+    service.settings = service.settings.replace(hl_concurrency=1)
+    a1 = service.create({"prompt": "a1"}, credential="acct-a")
+    a2 = service.create({"prompt": "a2"}, credential="acct-a")
+    b1 = service.create({"prompt": "b1"}, credential="acct-b")
+
+    Coordinator(service, service.settings).tick()
+    assert service.store.get_full(a1["task_id"])["status"] == ST_IN_PROGRESS
+    assert service.store.get_full(a2["task_id"])["status"] == ST_QUEUED, \
+        "A 账号第二个任务必须在自己的队列里等（每账号 1 并发）"
+    assert service.store.get_full(b1["task_id"])["status"] == ST_IN_PROGRESS, \
+        "B 账号不能被 A 的满额在途挤掉"
+
+
+def test_multi_account_gate_cooldown_is_per_account(service, fake) -> None:
+    """A 命中风控进冷却 ⇒ 只停 A 自己；B 的提交不受影响。"""
+    from app.coordinator import Coordinator
+
+    service.settings = service.settings.replace(hl_concurrency=2)
+    service.gate_for("acct-a").enter_cooldown("模拟 A 命中风控")
+    a = service.create({"prompt": "a1"}, credential="acct-a")
+    b = service.create({"prompt": "b1"}, credential="acct-b")
+
+    Coordinator(service, service.settings).tick()
+    assert service.store.get_full(a["task_id"])["status"] == ST_QUEUED, \
+        "A 冷却期内必须被自己的闸门挡住"
+    assert service.store.get_full(b["task_id"])["status"] == ST_IN_PROGRESS, \
+        "A 的冷却绝不能拖累 B 的提交"
+    assert len(fake.create_calls) == 1
+    assert service.gate_for("acct-a").in_cooldown
+    assert not service.gate_for("acct-b").in_cooldown

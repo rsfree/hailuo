@@ -769,12 +769,13 @@ def test_apply_feeds_all_failed_is_failure(service) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_view_queued_includes_degradations_only_when_nonempty() -> None:
+def test_view_never_exposes_degradations() -> None:
+    """降级说明**不进 HTTP 响应**（2026-10-10 接口字段收敛）：只进日志与任务库。"""
     code, body = view({"task_id": "t", "status": ST_QUEUED, "degradations": []})
     assert code == 202 and "degradations" not in body
     code, body = view({"task_id": "t", "status": ST_QUEUED,
                        "degradations": ["x"]})
-    assert body["degradations"] == ["x"]
+    assert code == 202 and "degradations" not in body
 
 
 def test_view_success_has_no_degradations_key_when_empty() -> None:

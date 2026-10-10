@@ -212,9 +212,10 @@ GET /api/v3/contents/generations/tasks/cgt-20260923004105-a1b2c3d4e5
 - 🟡 `usage` 里 `completion_tokens`/`total_tokens` 恒为 `0` —— 上游**不按 token 计费**，
   编一个数字就是伪造。真实成本信息在**加性扩展** `usage.forecast_credits`
   （来自上游计价表的**预估**积分，不是账单实扣值）。
-- 🟡 `degradations`（**非空时出现**）是本服务的加性扩展：逐条说明"请求了 A、实际做了 B"。
-  它是**可选的**，OpenAI/Ark 客户端会忽略它。
-- 🟡 `frames` 换算、档位吸附、`ratio` 不转发这件事**都在 `degradations` 里** ——
+- 🟡 降级留痕（`degradations`）**不进 HTTP 响应**（2026-10-10 接口字段收敛）：
+  逐条说明"请求了 A、实际做了 B"，只进**服务日志**（受理时 `降级留痕：` 前缀，
+  带 task_id）与任务库 `degradations_json`。排查以日志为准。
+- 🟡 `frames` 换算、档位吸附、`ratio` 不转发这件事**都在降级留痕里** ——
   静默降级等于让人按 A 的预期为 B 付钱。
 
 ---
@@ -365,4 +366,4 @@ GET /v1/api/user/info      → data.userInfo.{name,userID,vipInfo.type,retention
 | 音频参考（`generate_audio` / 音频素材） | 音频上传与字段形态未取证 |
 | `callback_url`（webhook） | 没有回调通道，不复刻上游的回调重试语义 |
 | 真实上游并发/频控阈值 | 未取证；闸门沿用图片链路的保守默认 |
-| 其余模型的端到端实测 | 已实测 `23204` / `23218` / `23210`（默认族三槽位）。其它族（`veo3.1` / `sora2` / `hailuo3.0` / `hailuo_h3_max_*` / seedance2.0*）**未实跑**：档位与单价来自公开端点，创建 body 同构，但**各自可能有自己的前置校验**（正如 512 档那次）⇒ 首次使用某族前请先看 `degradations` 并预留一次失败预算 |
+| 其余模型的端到端实测 | 已实测 `23204` / `23218` / `23210`（默认族三槽位）。其它族（`veo3.1` / `sora2` / `hailuo3.0` / `hailuo_h3_max_*` / seedance2.0*）**未实跑**：档位与单价来自公开端点，创建 body 同构，但**各自可能有自己的前置校验**（正如 512 档那次）⇒ 首次使用某族前请先看受理日志的降级留痕并预留一次失败预算 |

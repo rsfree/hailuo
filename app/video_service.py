@@ -320,6 +320,9 @@ class VideoService(Service):
         logger.bind(task_id=rec["task_id"]).info(
             f"已受理视频：{capability} model={upstream_model} "
             f"mode={plan.mode} duration={plan.duration}s")
+        #: 🔴 降级说明只进日志与任务库，不出现在 HTTP 响应（与图片链路同一口径）。
+        for note in plan.degradations:
+            logger.bind(task_id=rec["task_id"]).info(f"降级留痕：{note}")
         return rec
 
     # ------------------------------------------------------------------ 翻译层
@@ -450,7 +453,9 @@ class VideoService(Service):
         plan = full["plan"] or {}
         self.store.update_task(task_id, attempts=(full.get("attempts") or 0) + 1)
 
-        decision = self.gate.check()
+        #: 🔴 用**本任务所属账号**的闸门（多账号隔离，见 `Service.gate_for`）
+        gate = self.gate_for(full.get("credential_id"))
+        decision = gate.check()
         if not decision.allowed:
             logger.bind(task_id=task_id).debug(f"闸门拦截：{decision.reason}")
             return {"submitted": False, "reason": decision.reason}
@@ -477,6 +482,7 @@ class VideoService(Service):
                 for (_, frame_type), (uploaded, norm_notes, traces) in zip(jobs, results):
                     for note in norm_notes:
                         self.store.add_degradation(task_id, note)
+                        logger.bind(task_id=task_id).info(f"归一化留痕：{note}")
                     for t in traces:
                         OBS.upstream(f"upload.{t.get('stage')}", task_id=task_id, **t)
                     file_list.append(uploaded.to_video_frame_entry(frame_type))
@@ -503,7 +509,7 @@ class VideoService(Service):
             return {"submitted": False, "dry_run": True, "trace": trace,
                     "file_list": file_list}
 
-        self.gate.note_submit()
+        gate.note_submit()
         self.store.update_task(
             task_id, status="in_progress", upstream_batch_id=batch_id,
             #: 🔴 **记录 id 也要存**：它既是 `data.id`，也是 v4 点名直查唯一认的句柄
@@ -650,7 +656,8 @@ def video_view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     ⚠️ **失败也回 200**（与图片链路同一姿势）：任务本身完成了，只是结果是失败；
     回 4xx 会误触发调用方的重试逻辑。
 
-    `degradations` 是本服务的加性扩展：**只在非空时出现**。
+    降级说明**不出现在响应里**（2026-10-10 接口字段收敛）：只进服务日志
+    （`降级留痕：…`，带 task_id）与任务库 `degradations_json`。
     """
     task_id = record["task_id"]
     status = record.get("status")
@@ -658,7 +665,6 @@ def video_view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     plan = record.get("plan") or {}
     result = record.get("result") or {}
     error = record.get("error") or {}
-    degradations = record.get("degradations") or []
 
     created_at = int(record.get("created_at") or 0)
     updated_at = int(record.get("updated_at") or record.get("finished_at") or created_at)
@@ -706,8 +712,6 @@ def video_view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         #: 非终态：原生形态里 `content` 仍带着一个空的 video_url
         body["content"] = {"video_url": ""}
 
-    if degradations:
-        body["degradations"] = degradations
     return 200, body
 
 

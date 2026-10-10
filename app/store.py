@@ -345,12 +345,32 @@ class TaskStore:
             ).all()
             return [r.to_dict() for r in rows]
 
-    def count_active(self) -> int:
-        """在途任务数 —— **`HL_CONCURRENCY` 的判据**（按库计数，重启安全）。"""
+    def count_active(self, credential_id: str | None = None) -> int:
+        """在途任务数 —— **`HL_CONCURRENCY` 的判据**（按库计数，重启安全）。
+
+        `credential_id` 给定 ⇒ 只数**该账号**的（多账号号池下，并发上限按账号隔离）；
+        `None` = 全部账号合计（观测/兼容旧语义）。
+        """
         with self.session() as s:
+            conds = [self.row_cls.status == ST_IN_PROGRESS]
+            if credential_id is not None:
+                conds.append(self.row_cls.credential_id == credential_id)
             return int(s.scalar(
-                select(func.count()).select_from(self.row_cls)
-                .where(self.row_cls.status == ST_IN_PROGRESS)) or 0)
+                select(func.count()).select_from(self.row_cls).where(*conds)) or 0)
+
+    def active_counts_by_credential(self) -> dict[str, int]:
+        """每个账号（凭据指纹）各有多少在途任务 —— 协调器**按账号分槽位**用。
+
+        一次分组查询拿全量，替代"每个账号各查一次 count_active"
+        （账号多时那是 N 次查询；排队判定是每 tick 都要跑的热路径）。
+        """
+        with self.session() as s:
+            rows = s.execute(
+                select(self.row_cls.credential_id, func.count())
+                .where(self.row_cls.status == ST_IN_PROGRESS)
+                .group_by(self.row_cls.credential_id)
+            ).all()
+            return {(cred or ""): int(n) for cred, n in rows}
 
     def count_queued(self) -> int:
         with self.session() as s:
