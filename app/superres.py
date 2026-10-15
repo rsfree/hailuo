@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import struct
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -182,8 +183,6 @@ class SuperRes:
         now = int(time.time()) - 60
         key_time = f"{now};{now + 900}"
         sig = _cos_signature(self.secret_key, "get", pathname, key_time, params)
-        kv = "&".join(f"{k.lower()}={urllib.parse.quote(str(v), safe='')}"
-                      for k, v in sorted(params.items()))
         plist = ";".join(sorted(k.lower() for k in params))
         auth = (f"q-sign-algorithm=sha1&q-ak={self.secret_id}"
                 f"&q-sign-time={key_time}&q-key-time={key_time}"
@@ -239,7 +238,7 @@ class SuperRes:
         超分倍数作用在输入尺寸上 ⇒ 尺寸纹丝不动优先（JPEG 重编码），
         确实压不进预算再按比例缩（极端兜底）。
         """
-        from PIL import Image
+        from PIL import Image  # noqa: PLC0415 —— media.py 同款：重依赖懒加载
 
         if len(data) <= budget:
             return data
@@ -268,8 +267,6 @@ class SuperRes:
 
 def _png_size(data: bytes) -> tuple[int, int]:
     """PNG IHDR 里的宽高（不引 PIL 依赖链的轻量读取）。"""
-    import struct
-
     return struct.unpack(">II", data[16:24])
 
 

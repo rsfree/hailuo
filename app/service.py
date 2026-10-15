@@ -1110,7 +1110,7 @@ class Service:
             payload["superres"] = {"status": "disabled",
                                    "note": "SUPERRES_ENABLED=0 ⇒ 交付原图"}
             logger.bind(task_id=task_id).warning(
-                f"超分被关闭（SUPERRES_ENABLED=0）⇒ 任务按原图交付")
+                "超分被关闭（SUPERRES_ENABLED=0）⇒ 任务按原图交付")
             return payload
 
         sr = superres.SuperRes.from_settings(

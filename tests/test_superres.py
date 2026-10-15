@@ -11,9 +11,7 @@
 """
 from __future__ import annotations
 
-import json
 import struct
-from urllib.parse import urlparse
 
 import httpx
 import pytest
