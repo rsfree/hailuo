@@ -52,6 +52,7 @@ from .credentials import CredentialPool, parse_jwt
 from .errors import (
     AdapterError,
     CapabilityUnavailable,
+    ContentPolicyError,
     InvalidParameterError,
     RiskControlChallenge,
     TaskNotDeletable,
@@ -240,6 +241,12 @@ class Service:
         #: 本服务自建 httpx 客户端时统一用它（输入图下载 + 能力表读取）
         #: —— **测试靠它做到零出网**。为 `None` 时走真实网络。
         self._http_transport = http_transport
+        #: 🔴 内容违规**负缓存**（2026-10-15 用户口径）：key =
+        #: `_negcache_key(prompt, image_urls)`，value = 过期时刻（time.time()）。
+        #: 命中 ⇒ 受理直接 451，**不落库、不打上游**。内存态：单进程足够，
+        #: 重启清空（重新触达一次上游即重建）。
+        self._negcache: dict[str, float] = {}
+        self._negcache_lock = threading.Lock()
         self._caps_degradations: list[str] = []
         self._caps_refreshed_at: float = 0.0
         #: 指纹密钥：让**明文 Key 永不落库**
@@ -338,6 +345,42 @@ class Service:
         self.store.update_task(
             task_id, status="failure", finished_at=time.time(),
             error={"message": str(err), "type": err.error_type, "code": err.code})
+        if isinstance(err, ContentPolicyError):
+            self._negcache_from_plan(task_id)
+
+    # ---------------- 负缓存（内容违规）：key/命中/写入 ----------------
+
+    @staticmethod
+    def _negcache_key(prompt: str, image_urls: list[str] | None) -> str:
+        material = (prompt or "") + "\x00" + "\x00".join(sorted(image_urls or []))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _negcache_from_plan(self, task_id: str) -> None:
+        """按任务库里存的 plan 写负缓存（失败收口/提交失败共用）。"""
+        full = self.store.get_full(task_id) or {}
+        plan = full.get("plan") or {}
+        self._negcache_put(self._negcache_key(plan.get("desc") or "",
+                                              plan.get("image_urls") or []))
+
+    def _negcache_put(self, key: str) -> None:
+        if not self.settings.negcache_enabled:
+            return
+        with self._negcache_lock:
+            self._negcache[key] = time.time() + self.settings.negcache_ttl
+
+    def _negcache_hit(self, key: str) -> bool:
+        """命中且未过期 ⇒ True（惰性清理过期项）。开关关闭恒 False。"""
+        if not self.settings.negcache_enabled:
+            return False
+        now = time.time()
+        with self._negcache_lock:
+            expire = self._negcache.get(key)
+            if expire is None:
+                return False
+            if expire > now:
+                return True
+            self._negcache.pop(key, None)
+            return False
 
     # ------------------------------------------------------------------ 公开访问器
     # 这两条存在的理由：协调器与 `/capabilities` 路由都要读它们。
@@ -623,6 +666,14 @@ class Service:
             requested_resolution=requested_resolution,
             superres_magnify=magnify,
         )
+        #: 🔴 负缓存命中 ⇒ 直接 451，**不落库、不打上游**（重复提交违禁内容
+        #: 只会重复浪费审核往返）。提交/轮询阶段判违规时会写入这里。
+        if self._negcache_hit(self._negcache_key(plan.desc, plan.image_urls)):
+            raise ContentPolicyError(
+                "该提示词/图片组合此前已被上游判定违规（负缓存命中，"
+                f"TTL {int(self.settings.negcache_ttl)}s）。请修改提示词或更换图片后重试；"
+                "如确认内容合规，可稍后在缓存过期后重试。")
+
         return plan, capability, upstream_model
 
     # ------------------------------------------------------------------ 翻译辅助
@@ -1104,6 +1155,10 @@ class Service:
             error={"message": message + (f" 上游消息：{detail}" if detail else ""),
                    "type": "upstream_error", "code": code},
         )
+        if code == "content_policy_violation":
+            #: 🔴 轮询终态命中敏感（status 5/14 等）⇒ 负缓存该组合，
+            #: 同 prompt/图的重放直接 451，不再送审。
+            self._negcache_from_plan(task_id)
         OBS.event("task.failed", task_id=task_id, upstream_status=feed.status,
                   upstream_status_name=status_name(feed.status))
         logger.bind(task_id=task_id).warning(
@@ -1254,6 +1309,9 @@ class Service:
                              "refreshed_at": self._caps_refreshed_at},
             "observability": OBS.status(),
             "upload_cache": self._uploader.cache_stats() if self._uploader else None,
+            "negcache": {"enabled": self.settings.negcache_enabled,
+                         "entries": len(self._negcache),
+                         "ttl": self.settings.negcache_ttl},
         }
 
 
@@ -1267,10 +1325,12 @@ def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
     · 非终态 → **202** + `{task_id, status}`（调用方据此继续轮询）；
     · 成功 → **200** + `{data: [{url}], created, usage}`；
-    · 失败 → **200** + `{task_id, status: "failure", error}`。
+    · 失败 → **200** + `{task_id, status: "failure", error}`；
+      · ⚠️ 例外：**内容违规（content_policy_violation）→ 451**（2026-10-15
+        用户口径）——调用方必须一眼可辨且**不可重试**。
 
     ⚠️ **失败也回 200**：任务本身完成了（只是结果是失败），请求没出错。
-    回 4xx 会误触发调用方的重试逻辑。
+    回 4xx 会误触发调用方的重试逻辑。451 是唯一例外。
 
     降级说明**不出现在响应里**（2026-10-10 接口字段收敛）：留痕只进
     **服务日志**（受理时 `降级留痕：…` / 提交时 `归一化留痕：…`，带 task_id）
@@ -1301,6 +1361,10 @@ def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         "message": "任务失败（上游未给出原因）。", "type": "upstream_error",
         "code": "task_failed",
     }
+    if error.get("code") == "content_policy_violation":
+        #: 🔴 内容违规（2026-10-15 用户口径）：**451** 代替 200+failure ——
+        #: 调用方一眼可辨且不该重试；其余失败仍 200（避免误触发重试逻辑）。
+        return 451, {"task_id": task_id, "status": "failure", "error": error}
     return 200, {"task_id": task_id, "status": "failure", "error": error}
 
 

@@ -188,6 +188,13 @@ class Settings:
     #: 预签名 URL 有效期（秒）。24h：调用方（newapi 号池）拿到手还会转存。
     superres_url_ttl: float = 86400.0
 
+    # ------------------------------------------------------------ 负缓存（内容违规）
+    #: 🔴 同一 (prompt, 输入图) 组合被上游判违规后，TTL 内直接 451 拒绝、
+    #: **不再打上游**——重复提交违禁内容只会重复浪费审核往返（且上游是否
+    #: 对被拒请求计费未取证）。内存态：单容器单进程足够，重启清空可接受。
+    negcache_enabled: bool = True
+    negcache_ttl: float = 86400.0
+
     # ------------------------------------------------------------ 可观测性
     otel_token: str = ""
     otel_service_name: str = "hailuo-service"
@@ -307,6 +314,8 @@ class Settings:
             superres_enabled=_b("SUPERRES_ENABLED", True),
             superres_timeout=_f("SUPERRES_TIMEOUT", 90.0),
             superres_url_ttl=_f("SUPERRES_URL_TTL", 86400.0),
+            negcache_enabled=_b("NEG_CACHE_ENABLED", True),
+            negcache_ttl=_f("NEG_CACHE_TTL", 86400.0),
             otel_token=_s("LOGFIRE_TOKEN"),
             otel_service_name=_s("OTEL_SERVICE_NAME", "hailuo-service"),
             otel_environment=_s("LOGFIRE_ENVIRONMENT"),

@@ -65,9 +65,15 @@ class InvalidParameterError(AdapterError):
 
 
 class ContentPolicyError(AdapterError):
-    """上游送审 / 版权拦截。**换 prompt 或换图**，重试无效。"""
+    """上游送审 / 版权拦截。**换 prompt 或换图**，重试无效。
 
-    status_code = 400
+    🔴 HTTP **451**（Unavailable For Legal Reasons，2026-10-15 用户口径）：
+    内容违规对调用方来说必须一眼可辨、且**不可重试**——200+failure 会被
+    当成普通失败重试，400 语义太泛。同义错误（受理期上游同步拒 /
+    轮询终态敏感 / 负缓存命中）都走这一个类，状态码天然一致。
+    """
+
+    status_code = 451
     code = "content_policy_violation"
     error_type = "invalid_request_error"
 

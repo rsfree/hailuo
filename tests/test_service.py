@@ -766,8 +766,12 @@ def test_poll_marks_failure_with_code(service, fake) -> None:
     assert full["status"] == ST_FAILURE
     assert full["error"]["code"] == "content_policy_violation"
     code, body = view(full)
-    assert code == 200, "失败也回 200（任务完成了，只是结果是失败）"
+    # 🔴 2026-10-15 用户口径：内容违规 ⇒ 451（唯一例外，其余失败仍 200）
+    assert code == 451
     assert body["status"] == "failure"
+    # 敏感终态同时写负缓存 ⇒ 同 prompt/图组合的二次受理直接 451
+    key = service._negcache_key("a cat", [IMG])
+    assert service._negcache_hit(key)
 
 
 def test_poll_ignores_unknown_batches(service, fake) -> None:
