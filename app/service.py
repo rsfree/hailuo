@@ -680,22 +680,19 @@ class Service:
 
     @staticmethod
     def _resolve_quantity(raw: Any, degradations: list[str]) -> int:
-        """`n`（出图张数）。**默认 1**，上界 10。
+        """`n`（出图张数）—— 🔴 **恒 1**（2026-10-15 用户口径：每次只生成 1 张）。
 
-        ⚠️ 不采用上游的 `defaultSelect` 张数 —— 默认必须是**最省**的那个，
-        否则调用方会按"1 张"的预期收到多张的账单。
+        上游对 quantity=N 回 N 条 feed 且**不同时就绪**（n=2 实测教训），
+        多张收口的复杂度与账单不可控性最终都由调用方默默承担 ⇒ 统一单张交付：
+        调用方要 N 张就发 N 个请求（天然并行、逐张可查、逐张计费可对账）。
+        显式传了 n≠1 才留痕；没传或 n=1 静默。值本身不再校验（反正被忽略）。
         """
-        if raw is None:
+        if raw is None or raw == 1:
             return 1
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            raise InvalidParameterError(f"n 必须是整数，实得 {raw!r}。", param="n")
-        n = int(raw)
-        if n < 1:
-            raise InvalidParameterError(f"n 必须 >= 1，实得 {n}。", param="n")
-        if n > 10:
-            degradations.append(f"请求 n={n} 超过本服务上限 10 ⇒ 已按 10 处理。")
-            return 10
-        return n
+        degradations.append(
+            f"请求 n={raw!r} ⇒ 按【单张策略】固定生成 1 张"
+            f"（2026-10-15 用户口径；要 N 张请发 N 个请求）。")
+        return 1
 
     @staticmethod
     def _resolve_size(

@@ -16,7 +16,7 @@ from app.errors import (
     TaskNotDeletable,
     TaskNotFoundError,
 )
-from app.service import view
+from app.service import Service, view
 from app.store import ST_FAILURE, ST_IN_PROGRESS, ST_QUEUED, ST_SUCCEEDED
 from app.upstream.hailuo.client import ST_FAIL, ST_CREATING, ST_SENSITIVE, Feed
 
@@ -309,16 +309,18 @@ def test_n_defaults_to_one(service) -> None:
     assert not any("吸附" in d for d in plan.degradations)
 
 
-def test_n_over_cap_is_clamped_and_noted(service) -> None:
+def test_n_is_always_pinned_to_one(service) -> None:
+    """🔴 单张策略（2026-10-15 用户口径）：显式 n≠1 ⇒ 覆盖为 1 并留痕。"""
     plan, _, _ = service.build_plan({"prompt": "x", "n": 99})
-    assert plan.quantity == 10
-    assert any("上限 10" in d for d in plan.degradations)
+    assert plan.quantity == 1
+    assert any("单张策略" in d for d in plan.degradations)
 
 
-@pytest.mark.parametrize("bad", [0, -1, "3"])
-def test_bad_n_is_400(service, bad) -> None:
-    with pytest.raises(InvalidParameterError):
-        service.build_plan({"prompt": "x", "n": bad})
+@pytest.mark.parametrize("bad", [0, -1, "3", "abc", None])
+def test_any_n_resolves_to_one(service, bad) -> None:
+    """值不再校验（恒 1）：非法值也按 1 走（只留痕，不 400）。"""
+    plan, _, _ = service.build_plan({"prompt": "x", "n": bad})
+    assert plan.quantity == 1
 
 
 # ---------------------------------------------------------------------------
@@ -531,14 +533,14 @@ def test_submit_builds_correct_upstream_body(service, fake) -> None:
     fake.add_image(IMG, PNG_1PX)
     rec = service.create(
         {"model": "nano_banana21_flash", "prompt": "a cat", "image": [IMG],
-         "n": 2, "size": "4096x4096"}, credential="c")
+         "size": "4096x4096"}, credential="c")
     res = service.submit(rec["task_id"])
     assert res["submitted"] is True
     assert res["upstream_batch_id"]
 
     body = fake.create_calls[0]
     assert body["projectID"] == "0"
-    assert body["quantity"] == 2
+    assert body["quantity"] == 1, "单张策略：上游请求恒 quantity=1"
     p = body["parameter"]
     assert p["modelID"] == "nano_banana21_flash"
     assert p["desc"] == "a cat"
@@ -844,10 +846,21 @@ def _feed(fid: str, status: int, url: str = "") -> Feed:
                 create_time=1, url=url)
 
 
+def _force_quantity_2(svc: Service, task_id: str) -> None:
+    """入口已恒 1（单张策略）——多张收口的**防御逻辑**仍要可测：
+    直接把库里 plan 的 quantity 拨回 2，模拟存量任务/上游回多张的情形。"""
+    import json as _json
+    full = svc.store.get_full(task_id)
+    plan = dict(full["plan"] or {})
+    plan["quantity"] = 2
+    svc.store.update_task(task_id, plan_json=_json.dumps(plan, ensure_ascii=False))
+
+
 def test_apply_feeds_waits_until_quantity_ready(service) -> None:
     """n=2 只到 1 张成功、另一条还在途 ⇒ **不许提前终态**（否则第二张白花钱）。"""
     rec = service.create({"prompt": "x", "n": 2}, credential="c")
     feeds = [_feed("f1", 2, "https://cdn/1.png"), _feed("f2", 1)]
+    _force_quantity_2(service, rec["task_id"])
     assert service._apply_feeds(rec["task_id"], feeds) is False
     full = service.store.get_full(rec["task_id"])
     assert full["status"] == ST_QUEUED  # 未推进任何终态
@@ -858,6 +871,7 @@ def test_apply_feeds_aggregates_all_when_quantity_ready(service) -> None:
     """n=2 两条都成功 ⇒ 终态成功，**聚合 2 个产物**。"""
     rec = service.create({"prompt": "x", "n": 2}, credential="c")
     feeds = [_feed("f1", 2, "https://cdn/1.png"), _feed("f2", 2, "https://cdn/2.png")]
+    _force_quantity_2(service, rec["task_id"])
     assert service._apply_feeds(rec["task_id"], feeds) is True
     full = service.store.get_full(rec["task_id"])
     assert full["status"] == ST_SUCCEEDED
@@ -868,6 +882,7 @@ def test_apply_feeds_partial_failure_still_delivers(service) -> None:
     """n=2 一条成功一条失败 ⇒ 按已有产物**成功交付**（部分成功也是交付）。"""
     rec = service.create({"prompt": "x", "n": 2}, credential="c")
     feeds = [_feed("f1", 2, "https://cdn/1.png"), _feed("f2", 3)]
+    _force_quantity_2(service, rec["task_id"])
     assert service._apply_feeds(rec["task_id"], feeds) is True
     full = service.store.get_full(rec["task_id"])
     assert full["status"] == ST_SUCCEEDED
@@ -878,6 +893,7 @@ def test_apply_feeds_all_failed_is_failure(service) -> None:
     """n=2 全部失败 ⇒ 终态失败。"""
     rec = service.create({"prompt": "x", "n": 2}, credential="c")
     feeds = [_feed("f1", 3), _feed("f2", 5)]
+    _force_quantity_2(service, rec["task_id"])
     assert service._apply_feeds(rec["task_id"], feeds) is True
     full = service.store.get_full(rec["task_id"])
     assert full["status"] == ST_FAILURE
