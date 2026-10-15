@@ -163,6 +163,36 @@ def test_image_limit_uses_model_declared_cap() -> None:
         svc.close()
 
 
+def test_off_table_ratio_snaps_to_nearest() -> None:
+    """🔴 表外比例自动映射（2026-10-15 用户口径）：flare 不支持 1:4/8:1 等
+    极端比例 ⇒ 吸附到最近支持档并留痕，不 400。"""
+    from app import models as m2
+
+    m2.install_runtime_models(list(m2.FROZEN_SNAPSHOT))
+    from app.config import Settings
+    from app.service import Service
+
+    st = Settings(task_db="sqlite+pysqlite:///:memory:", hailuo_token="t")
+    st.validate()
+    svc = Service(st, fetch_capabilities=False)
+    try:
+        cases = {"1:4": "9:16", "4:1": "21:9", "1:8": "9:16", "8:1": "21:9"}
+        for raw, expect in cases.items():
+            plan, _, _ = svc.build_plan(
+                {"model": "gpt-image-2.5-flare", "prompt": "x",
+                 "aspect_ratio": raw, "resolution": "1K"})
+            assert plan.aspect_ratio == expect, f"{raw} ⇒ {plan.aspect_ratio}"
+            joined = " ".join(plan.degradations)
+            assert "自动映射" in joined and raw in joined, raw
+        # i2i 的 Auto 保留、t2i 的 Auto 丢弃（防回归）
+        plan_a, _, _ = svc.build_plan(
+            {"model": "gpt-image-2.5-flare", "prompt": "x", "aspect_ratio": "Auto"})
+        assert plan_a.aspect_ratio is None
+    finally:
+        svc.close()
+        m2.install_runtime_models([])
+
+
 def test_gpt_image_family_redirects_to_flare() -> None:
     """🔴 成本策略定向（2026-10-15）：gpt-image* 一律落 gpt-image-2.5-flare。"""
     models.install_runtime_models(list(models.FROZEN_SNAPSHOT))
@@ -353,7 +383,7 @@ def test_defaults_pin_cheapest_tier(service) -> None:
     """
     plan, _, _ = service.build_plan({"prompt": "x"})
     assert plan.resolution == "1K"
-    assert plan.aspect_ratio == "Auto"
+    assert plan.aspect_ratio is None  # Auto 是 i2i 语义 ⇒ t2i 不发送该键
     joined = " ".join(plan.degradations)
     assert "写死最便宜档" in joined
     assert "defaultSelect" in joined          # 说明里仍交代上游默认是什么、为何不用

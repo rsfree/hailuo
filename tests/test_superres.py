@@ -346,6 +346,21 @@ def test_enhance_result_disabled_switch() -> None:
         svc2.close()
 
 
+def test_t2i_auto_ratio_dropped(svc: Service) -> None:
+    """Auto 是 i2i 语义（跟随参考图）：t2i 时不发送该键（上游 code=2 实测），
+    i2i 时保留。"""
+    plan, _, _ = svc.build_plan(
+        {"model": "gpt-image-2.5-flare", "prompt": "x", "aspect_ratio": "Auto",
+         "resolution": "2K"})
+    assert plan.aspect_ratio is None
+    assert any("Auto" in d for d in plan.degradations)
+    plan2, _, _ = svc.build_plan(
+        {"model": "gpt-image-2.5-flare", "prompt": "x",
+         "image": ["https://cdn.example.com/a.png"],
+         "aspect_ratio": "Auto", "resolution": "2K"})
+    assert plan2.aspect_ratio == "Auto", "i2i 的 Auto 必须保留"
+
+
 def test_plan_dict_carries_superres_fields(svc: Service) -> None:
     plan, _, _ = svc.build_plan(
         {"model": "gpt-image-2.5-flare", "prompt": "x", "resolution": "2K"})

@@ -584,6 +584,13 @@ class Service:
                 degradations.append(
                     f"【gpt-image 成本策略】上游恒按最便宜档生成（{'；'.join(forced)}）。")
 
+        # ---- Auto 只属于 i2i（2026-10-15 矩阵实测：t2i + Auto 上游 code=2）
+        if ratio == "Auto" and not image_urls:
+            ratio = None
+            degradations.append(
+                "aspect_ratio=Auto 是\"跟随参考图比例\"的 i2i 语义 ⇒ "
+                "文生图场景不发送该键（实测 t2i 带 Auto 会被上游 code=2 拒）。")
+
         # ---- referenceMode（**默认不发**）
         reference_mode = request.get("reference_mode")
         if reference_mode is not None:
@@ -677,9 +684,21 @@ class Service:
         if ratio is not None:
             ratio = str(ratio)
             if model_meta.aspect_ratios and ratio not in model_meta.aspect_ratios:
-                raise InvalidParameterError(
-                    f"aspect_ratio={ratio!r} 不被 {model_meta.model_id} 支持，"
-                    f"可选：{list(model_meta.aspect_ratios)}。", param="aspect_ratio")
+                #: 🔴 表外比例**自动映射**（2026-10-15 用户口径，bfl 防御模式同款）：
+                #: 上游对表外比例轻则拒绝、重则静默吞钱 ⇒ 适配器吸附到最近支持档，
+                #: 把"拿 400"变成"拿图 + 一条看得见的留痕"。
+                rv = _ratio_value(ratio)
+                snapped = (_snap_ratio(rv, model_meta.aspect_ratios)
+                           if rv is not None else None)
+                if snapped is None:
+                    raise InvalidParameterError(
+                        f"aspect_ratio={ratio!r} 不被 {model_meta.model_id} 支持，"
+                        f"可选：{list(model_meta.aspect_ratios)}。", param="aspect_ratio")
+                notes.append(
+                    f"aspect_ratio={ratio!r} 不被 {model_meta.model_id} 支持 ⇒ "
+                    f"**自动映射**到 {snapped}"
+                    f"（该模型可选：{list(model_meta.aspect_ratios)}）。")
+                ratio = snapped
 
         supported_q = {q for row in model_meta.costs for q in (row.get("qualities") or [])}
         if quality is not None:
