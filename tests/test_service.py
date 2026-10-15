@@ -134,7 +134,12 @@ def test_image_string_is_rejected_with_fix_instructions(service) -> None:
 
 
 def test_image_limit_uses_model_declared_cap() -> None:
-    """`gpt-image-1.5` 声明 3 张 ⇒ 传 4 张必须 400（**不是静默丢弃**）。"""
+    """`gpt-image-2.5-flare` 声明 16 张 ⇒ 传 17 张必须 400（**不是静默丢弃**）。
+
+    ⚠️ 2026-10-15 起旧枚举 gpt-image-1.5（上限 3）已被成本策略**定向**到
+    flare —— 上限校验仍按"定向后的模型"执行（flare=16），旧拼法传 17 张
+    同样超限 400，意图不变。
+    """
     models.install_runtime_models(list(models.FROZEN_SNAPSHOT))
     from app.config import Settings
     from app.service import Service
@@ -143,18 +148,47 @@ def test_image_limit_uses_model_declared_cap() -> None:
     st.validate()
     svc = Service(st, fetch_capabilities=False)
     try:
-        m = models.get_model("gpt-image-1.5")
-        assert m is not None and m.max_support_image_count == 3
+        m = models.get_model("gpt-image-2.5-flare")
+        assert m is not None and m.max_support_image_count == 16
         with pytest.raises(InvalidParameterError) as ei:
-            svc.build_plan({"model": "gpt-image-1.5", "prompt": "x",
-                            "image": [f"{IMG}?i={i}" for i in range(4)]})
+            svc.build_plan({"model": "gpt-image-2.5-flare", "prompt": "x",
+                            "image": [f"{IMG}?i={i}" for i in range(17)]})
         assert ei.value.param == "image"
-        assert "3" in str(ei.value)
-        assert "gpt-image-1.5" in str(ei.value)
-        # 3 张（= 上限）必须放行
-        plan, _, _ = svc.build_plan({"model": "gpt-image-1.5", "prompt": "x",
-                                     "image": [f"{IMG}?i={i}" for i in range(3)]})
-        assert len(plan.image_urls) == 3
+        assert "16" in str(ei.value)
+        # 16 张（= 上限）必须放行
+        plan, _, _ = svc.build_plan({"model": "gpt-image-2.5-flare", "prompt": "x",
+                                     "image": [f"{IMG}?i={i}" for i in range(16)]})
+        assert len(plan.image_urls) == 16
+    finally:
+        svc.close()
+
+
+def test_gpt_image_family_redirects_to_flare() -> None:
+    """🔴 成本策略定向（2026-10-15）：gpt-image* 一律落 gpt-image-2.5-flare。"""
+    models.install_runtime_models(list(models.FROZEN_SNAPSHOT))
+    from app.config import Settings
+    from app.service import Service
+
+    st = Settings(task_db="sqlite+pysqlite:///:memory:", hailuo_token="t")
+    st.validate()
+    svc = Service(st, fetch_capabilities=False)
+    try:
+        for alias in ("gpt-image-2", "gpt-image-2.5-sunburst",
+                      "gpt-image-1.5", "gpt-image", "gpt-image-1"):
+            plan, _, upstream = svc.build_plan(
+                {"model": alias, "prompt": "x"})
+            assert upstream == "gpt-image-2.5-flare", alias
+            assert plan.upstream_model == "gpt-image-2.5-flare"
+            assert any("定向" in d for d in plan.degradations), alias
+        # 1.5 档位词汇随之翻译（High ⇒ 4K ⇒ 超分 ×4）
+        plan, _, _ = svc.build_plan(
+            {"model": "gpt-image-1.5", "prompt": "x", "resolution": "High"})
+        assert plan.requested_resolution == "4K" and plan.superres_magnify == 4
+        assert plan.resolution == "1K" and plan.quality == "low"
+        # flare 精确拼法不受影响
+        _, _, exact = svc.build_plan(
+            {"model": "gpt-image-2.5-flare", "prompt": "x"})
+        assert exact == "gpt-image-2.5-flare"
     finally:
         svc.close()
 
@@ -311,13 +345,65 @@ def test_native_resolution_validated_against_model(service) -> None:
     assert ei.value.param == "resolution"
 
 
-def test_defaults_come_from_upstream_default_select(service) -> None:
-    """不指定档位 ⇒ 用上游 `defaultSelect` 标出来的那个，并写清来源。"""
+def test_defaults_pin_cheapest_tier(service) -> None:
+    """不指定档位 ⇒ **写死最便宜档**（2026-10-15 用户口径），不再跟随 defaultSelect。
+
+    假上游 1K/2K/4K 全部 defaultSelect ⇒ 取排序最小仍为 1K，
+    但降级说明必须说清是"写死"而不是"上游默认"。
+    """
     plan, _, _ = service.build_plan({"prompt": "x"})
-    assert plan.resolution == "1K"      # 假上游里 1K/2K/4K 都 defaultSelect，取第一个
+    assert plan.resolution == "1K"
     assert plan.aspect_ratio == "Auto"
     joined = " ".join(plan.degradations)
-    assert "defaultSelect" in joined
+    assert "写死最便宜档" in joined
+    assert "defaultSelect" in joined          # 说明里仍交代上游默认是什么、为何不用
+    assert "已不作为默认" in joined
+    # nano 无 quality 维度 ⇒ 写死不适用于它，quality 不应出现
+    assert plan.quality is None
+
+
+def test_flare_defaults_pin_1k_low() -> None:
+    """🔴 `gpt-image-2.5-flare` 默认 = 1K + low（用户口径 2026-10-15）。
+
+    flare 的 defaultSelect 是 **2K**，若跟随上游默认，"没指定"的调用方
+    要为 1K 能做的事付 2.5 倍积分（2K low=5 vs 1K low=2）。
+    且 gpt-image-* 按 resolution×quality 计价，quality 不带键时上游按哪档
+    收费未取证 ⇒ 写死 low，把"未知"变成"已知"。
+    """
+    from app import models as m
+
+    m.install_runtime_models(list(m.FROZEN_SNAPSHOT))
+    from app.config import Settings
+    from app.service import Service
+
+    st = Settings(task_db="sqlite+pysqlite:///:memory:", hailuo_token="t")
+    st.validate()
+    svc = Service(st, fetch_capabilities=False)
+    try:
+        plan, _, upstream = svc.build_plan(
+            {"model": "gpt-image-2.5-flare", "prompt": "a dog", "aspect_ratio": "21:9"})
+        assert upstream == "gpt-image-2.5-flare"
+        assert plan.resolution == "1K", "defaultSelect=2K 必须被写死口径覆盖为 1K"
+        assert plan.quality == "low"
+        assert plan.aspect_ratio == "21:9"   # 显式传值仍透传
+        assert plan.forecast_credits == 2.0  # 1K×low 真实单价
+        joined = " ".join(plan.degradations)
+        assert "写死最便宜档 1K" in joined
+        assert "写死 low" in joined
+
+        # 显式传更高档 ⇒ 🔴 成本策略覆盖：上游仍 1K/low，请求档位转超分计划
+        plan2, _, _ = svc.build_plan(
+            {"model": "gpt-image-2.5-flare", "prompt": "x",
+             "resolution": "4K", "quality": "high"})
+        assert plan2.resolution == "1K" and plan2.quality == "low"
+        assert plan2.requested_resolution == "4K"
+        assert plan2.superres_magnify == 4
+        assert plan2.forecast_credits == 2.0  # 计费口径也是 1K/low
+        joined2 = " ".join(plan2.degradations)
+        assert "gpt-image 成本策略" in joined2 and "×4" in joined2
+    finally:
+        svc.close()
+        m.install_runtime_models([])  # 还原：别污染其他用例的运行期表
 
 
 # ---------------------------------------------------------------------------

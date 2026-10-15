@@ -46,7 +46,7 @@ from typing import Any
 
 from loguru import logger
 
-from . import media, models
+from . import media, models, superres
 from .config import Settings
 from .credentials import CredentialPool, parse_jwt
 from .errors import (
@@ -93,6 +93,11 @@ SYNC_WAIT_POLL_INTERVAL = 0.5
 #: 所以每次映射都进 `degradations`。
 _RES_BY_MAX_SIDE: tuple[tuple[int, str], ...] = ((1536, "1K"), (2560, "2K"))
 
+#: resolution 档位**从便宜到贵**的排序（未知档位排最后）。
+#: 🔴 用户口径（2026-10-15）：调用方未指定 resolution 时**写死最便宜档**，
+#: 不再跟随上游 `defaultSelect`（flare 的 defaultSelect 是 2K ⇒ 默认贵 2.5 倍）。
+_RES_ORDER: dict[str, int] = {"Low": 0, "1K": 1, "Medium": 2, "2K": 3, "High": 4, "4K": 5}
+
 
 def _ratio_value(text: str) -> float | None:
     m = _RATIO_RE.match(text.strip())
@@ -127,6 +132,11 @@ class Plan:
     degradations: list[str] = field(default_factory=list)
     #: 预估积分（来自上游计价表，**只是预估**）
     forecast_credits: float | None = None
+    #: 调用方**原始请求**的目标档位（成本策略下 gpt-image-* 上游恒按最便宜档
+    #: 生成，这个字段只记录"调用方想要什么"，是超分倍数的决策依据）。
+    requested_resolution: str | None = None
+    #: 产物阶段要做的腾讯 CI 超分倍数（None = 不超分）。2K→×2、4K→×4。
+    superres_magnify: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +152,8 @@ class Plan:
             "use_origin_prompt": self.use_origin_prompt,
             "degradations": list(self.degradations),
             "forecast_credits": self.forecast_credits,
+            "requested_resolution": self.requested_resolution,
+            "superres_magnify": self.superres_magnify,
         }
 
     def prompt_struct(self) -> str:
@@ -445,7 +457,19 @@ class Service:
 
         # ---- 上游模型
         raw_model = str(request.get("model") or "").strip()
+        original_model = raw_model
         raw_model = models.canonical_model_id(raw_model)  # 别名 → 规范 modelID（零说明）
+        #: 🔴 成本策略定向（2026-10-15）：gpt-image* ⇒ flare。档位词汇一并
+        #: 翻译（1.5 的 Low/Medium/High → flare 的 1K/2K/4K），后续按 flare
+        #: 的枚举校验与成本策略走。
+        if raw_model != original_model and original_model.startswith(
+                models.GPT_IMAGE_PREFIX):
+            degradations.append(
+                f"【gpt-image 成本策略】model={original_model!r} ⇒ 定向到 "
+                f"{raw_model}（上游只按 flare 一个形态计费/出图）。")
+            vocab = {"Low": "1K", "Medium": "2K", "High": "4K"}
+            if str(request.get("resolution") or "") in vocab:
+                request["resolution"] = vocab[str(request["resolution"])]
         available = {m.model_id: m for m in models.all_models()}
         if raw_model and raw_model in available:
             # 调用方直接给了上游 modelID（精确匹配，**不做小写化**）
@@ -525,9 +549,40 @@ class Service:
                 f"文生图请用 hailuo-t2i 或留空 model。", param="image")
 
         # ---- (resolution, quality)
+        #: 🔴 成本策略（2026-10-15）：先记下调用方的**意图档位**（供超分决策）——
+        #: gpt-image-* 上游恒按最便宜档生成，请求档位只用于决定超分倍数。
+        requested_resolution = request.get("resolution")
+        if requested_resolution is None and request.get("size") is not None:
+            m = _SIZE_RE.match(str(request["size"]).strip())
+            if m:
+                requested_resolution = _resolution_from_size(
+                    int(m.group(1)), int(m.group(2)))
         resolution, quality, ratio_notes, ratio = self._resolve_size(
             request, model_meta, degradations)
         degradations += ratio_notes
+
+        #: 🔴 【gpt-image 成本策略】gpt-image-2 / 2.5-* 上游**恒 1K+low**、
+        #: gpt-image-1.5 恒 Low —— 上游高档是纯加价（4K/low=10 积分 vs
+        #: 1K/low=2 积分 + CI 超分一次几分钱）。调用方传更高档 ⇒ 忽略并转
+        #: 超分（2K/Medium→×2、4K/High→×4），每一处覆盖都留痕。
+        magnify: int | None = None
+        if upstream_model.startswith("gpt-image"):
+            requested = str(requested_resolution or "").upper()
+            magnify = {"2K": 2, "MEDIUM": 2, "4K": 4, "HIGH": 4}.get(requested)
+            target_res = "Low" if upstream_model == "gpt-image-1.5" else "1K"
+            forced: list[str] = []
+            if resolution != target_res:
+                forced.append(f"resolution={resolution!r}→{target_res}")
+                resolution = target_res
+            if target_res == "1K" and (quality or "").lower() != "low":
+                forced.append(f"quality={quality!r}→low")
+                quality = "low"
+            if magnify:
+                forced.append(
+                    f"目标档 {requested_resolution} ⇒ 产物阶段腾讯 CI 超分 ×{magnify} 补齐")
+            if forced:
+                degradations.append(
+                    f"【gpt-image 成本策略】上游恒按最便宜档生成（{'；'.join(forced)}）。")
 
         # ---- referenceMode（**默认不发**）
         reference_mode = request.get("reference_mode")
@@ -558,6 +613,8 @@ class Service:
             use_origin_prompt=True,
             degradations=degradations,
             forecast_credits=forecast,
+            requested_resolution=requested_resolution,
+            superres_magnify=magnify,
         )
         return plan, capability, upstream_model
 
@@ -592,7 +649,9 @@ class Service:
         三种输入形态，按优先级：
           1. **原生的 `resolution` + `aspect_ratio`** —— 直接按模型声明的枚举校验（最忠实）；
           2. **`size: "WxH"`** —— 换算：长边定 resolution 档，宽高比**吸附**到该模型支持的最接近比例；
-          3. 都没给 —— 用模型声明的 `defaultSelect`（通常是 **Auto**，即跟随参考图比例）。
+          3. 都没给 —— 🔴 **写死最便宜档**（2026-10-15 用户口径）：resolution 取
+             `_RES_ORDER` 里该模型支持的最小档（**不跟随上游 defaultSelect**，
+             flare 的 defaultSelect=2K 会贵 2.5 倍）；quality 维度存在时写死 `low`。
 
         🔴 **换算与吸附一定留痕**：`size` 不是上游的概念，
         "4096x4096 ⇒ 4K + 1:1" 是本服务的口径，调用方必须知道。
@@ -622,16 +681,25 @@ class Service:
                     f"aspect_ratio={ratio!r} 不被 {model_meta.model_id} 支持，"
                     f"可选：{list(model_meta.aspect_ratios)}。", param="aspect_ratio")
 
+        supported_q = {q for row in model_meta.costs for q in (row.get("qualities") or [])}
         if quality is not None:
             quality = str(quality).lower()
-            supported = {q for row in model_meta.costs for q in (row.get("qualities") or [])}
-            if supported and quality not in supported:
+            if supported_q and quality not in supported_q:
                 raise InvalidParameterError(
                     f"quality={quality!r} 不被 {model_meta.model_id} 支持，"
-                    f"可选：{sorted(supported)}。", param="quality")
-            if not supported:
+                    f"可选：{sorted(supported_q)}。", param="quality")
+            if not supported_q:
                 notes.append(f"模型 {model_meta.model_id} 没有 quality 维度 ⇒ 已忽略 quality。")
                 quality = None
+        elif supported_q:
+            #: 🔴 用户口径（2026-10-15）：quality **写死 low**。gpt-image-* 按
+            #: resolution × quality 计价，而不带这个键时上游按哪档收费**未取证**
+            #: （前端抓包恒带 quality）—— 默认走最便宜档，把"未知"变成"已知"，
+            #: 静默按高价档扣钱是最坏的降级。
+            quality = "low"
+            notes.append(
+                f"未指定 quality ⇒ 写死 low（{model_meta.model_id} 按 resolution×quality "
+                f"计价，默认取最便宜档；可选：{sorted(supported_q)}）。")
 
         if size is not None:
             m = _SIZE_RE.match(str(size).strip())
@@ -671,11 +739,17 @@ class Service:
             else:
                 notes.append(f"模型 {model_meta.model_id} 未声明比例档位 ⇒ 比例不转发。")
 
-        if resolution is None and model_meta.default_resolutions:
-            resolution = model_meta.default_resolutions[0]
+        if resolution is None and model_meta.resolutions:
+            #: 🔴 用户口径（2026-10-15）：未指定 resolution **写死最便宜档**
+            #: （1K < 2K < 4K；gpt-image-1.5 是 Low < Medium < High），
+            #: **不再跟随上游 defaultSelect** —— flare 的 defaultSelect 是 2K，
+            #: 跟着走会让"没指定"的调用方为 1K 能做的事付 2.5 倍积分。
+            resolution = min(model_meta.resolutions,
+                             key=lambda r: (_RES_ORDER.get(r, 99), r))
             notes.append(
-                f"未指定 resolution ⇒ 用上游默认档 {resolution}"
-                f"（defaultSelect={list(model_meta.default_resolutions)}）。")
+                f"未指定 resolution ⇒ 写死最便宜档 {resolution}"
+                f"（该模型可选：{list(model_meta.resolutions)}；"
+                f"上游 defaultSelect={list(model_meta.default_resolutions)} 已不作为默认）。")
         if ratio is None and model_meta.default_aspect_ratios:
             ratio = model_meta.default_aspect_ratios[0]
             notes.append(
@@ -980,6 +1054,10 @@ class Service:
                 logger.bind(task_id=task_id).warning(
                     f"部分成功：计划 {expected} 张，上游交付 {len(success)} 张"
                     f"（另有 {len(failed)} 条失败）——按已有产物交付")
+            #: 收口增强（成本策略的超分段）：在**写终态前**完成 ——
+            #: 调用方看到 succeeded 时 URL 就是最终形态，不存在"先 1K 后换链接"。
+            payload = self._enhance_result(
+                task_id, full, success, self._success_payload(success))
             self.store.update_task(
                 task_id, status=ST_SUCCEEDED,
                 **({"upstream_feed_id": primary.feed_id} if primary.feed_id else {}),
@@ -987,7 +1065,7 @@ class Service:
                 finished_at=time.time(),
                 #: 🔴 `result` 的形状由**管线**决定（图片 data[{url}] / 视频 asset 直链），
                 #: 所以走 `self._success_payload` —— 子类只覆写这一个方法即可。
-                result=self._success_payload(success),
+                result=payload,
             )
             OBS.event("task.succeeded", task_id=task_id, produced=len(success))
             #: 计数单位由**管线**决定（图片"张" / 视频"条"）—— 别让视频任务的日志
@@ -1012,6 +1090,68 @@ class Service:
         logger.bind(task_id=task_id).warning(
             f"任务失败：{status_name(feed.status)} {message}")
         return True
+
+    def _enhance_result(self, task_id: str, full: dict[str, Any],
+                        feeds: list[Feed], payload: dict[str, Any]) -> dict[str, Any]:
+        """收口增强：成本策略的超分段（gpt-image-* 1K 产物 → CI 放大到请求档位）。
+
+        🔴 **任一张失败 ⇒ 全部回退原图**（半超分半原图的混合交付会把
+        "哪些 URL 是放大的"变成调用方的猜谜）。回退一定在 `superres.status`
+        里留痕 —— 静默回退等于让人按 4K 的预期拿到 1K 还以为成功了。
+
+        ⚠️ 在协调器收口线程里同步执行：CI 同步超分秒级（bfl 实测），
+        n≤10 的最坏情形也在预算内；阻塞只推迟本轮 tick，不影响任务终态正确性。
+        """
+        plan = full.get("plan") or {}
+        magnify = plan.get("superres_magnify")
+        if not magnify:
+            return payload
+        if not self.settings.superres_enabled:
+            payload["superres"] = {"status": "disabled",
+                                   "note": "SUPERRES_ENABLED=0 ⇒ 交付原图"}
+            logger.bind(task_id=task_id).warning(
+                f"超分被关闭（SUPERRES_ENABLED=0）⇒ 任务按原图交付")
+            return payload
+
+        sr = superres.SuperRes.from_settings(
+            self.settings, transport=self._http_transport)
+        try:
+            if not sr.configured():
+                reason = "未配置腾讯 CI 凭据/桶（TENCENT_API_KEY + SUPERRES_BUCKET）"
+                payload["superres"] = {"status": "fallback", "reason": reason}
+                logger.bind(task_id=task_id).warning(f"超分回退：{reason}")
+                return payload
+            data_out: list[dict[str, Any]] = []
+            dims: tuple[int, int] | None = None
+            for i, f in enumerate(feeds):
+                blob = media.download_image(
+                    f.url, max_bytes=self.settings.max_download_bytes,
+                    transport=self._http_transport)
+                key = f"superres/{task_id}/{i}_x{int(magnify)}.png"
+                res = sr.super_resolve(blob.data, int(magnify), object_key=key)
+                data_out.append({"url": sr.presigned_get(
+                    key, ttl_s=self.settings.superres_url_ttl)})
+                if dims is None:
+                    dims = (res.width, res.height)
+            payload["data"] = data_out
+            if dims:
+                payload["width"], payload["height"] = dims
+            payload["superres"] = {
+                "status": "ok", "magnify": int(magnify),
+                "requested": plan.get("requested_resolution"),
+                "images": len(data_out),
+            }
+            logger.bind(task_id=task_id).info(
+                f"超分完成：{len(data_out)} 张 ×{magnify}（{dims[0]}×{dims[1]}）")
+            return payload
+        except Exception as e:  # noqa: BLE001 —— 超分失败绝不拖垮已花钱的任务
+            reason = f"{type(e).__name__}: {e}"
+            payload["superres"] = {"status": "fallback", "reason": reason[:300]}
+            logger.bind(task_id=task_id).warning(
+                f"超分失败 ⇒ 全部回退原图（上游产物不受影响）：{reason}")
+            return payload
+        finally:
+            sr.close()
 
     # ------------------------------------------------------------------ 查询
 

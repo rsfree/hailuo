@@ -22,7 +22,10 @@ from typing import Any, Iterable
 import httpx
 from loguru import logger
 
-from ...models import UpstreamModel
+from ...models import SNAPSHOT_DATE, FROZEN_SNAPSHOT, UpstreamModel
+
+#: 快照索引（merge 补位用；模块级算一次）。
+_SNAP_INDEX: dict[str, UpstreamModel] = {m.model_id: m for m in FROZEN_SNAPSHOT}
 
 #: 公开端点（无鉴权、GET）。路径常量收在这里，改上游只改这两行。
 COMMON_CONFIG_PATH = "/public/api/config/web/common_config"
@@ -104,19 +107,44 @@ def merge(
     for mid in sorted(set(meta) | set(info)):
         m = meta.get(mid) or {}
         i = info.get(mid) or {}
+        resolutions = tuple(i.get("resolutions") or ())
+        default_res = tuple(i.get("default_resolutions") or ())
+        ratios = tuple(i.get("aspect_ratios") or ())
+        ratio_defaults = tuple(i.get("default_aspect_ratios") or ())
+        costs = tuple(i.get("costs") or ())
+        #: 🔴 快照补位（2026-10-15）：上游 `video/model/info` 的 imageModels
+        #: 已不再返回 gpt-image-2.5-sunburst / -flare（实测 11 清单 vs 9 条目），
+        #: 但网页前端仍对它们发 resolution/quality 并成功建任务（用户抓包）。
+        #: ⇒ 档位/计价缺失时退回冻结快照（同为该端点的历史实读），
+        #: 并在 `frozen_fallback` 留痕 —— 不补位会让写死默认与档位校验全部失效。
+        fallback: list[str] = []
+        snap = _SNAP_INDEX.get(mid)
+        if snap is not None:
+            if not resolutions and snap.resolutions:
+                resolutions = snap.resolutions
+                default_res = snap.default_resolutions
+                fallback.append("resolutions")
+            if not ratios and snap.aspect_ratios:
+                ratios = snap.aspect_ratios
+                ratio_defaults = snap.default_aspect_ratios
+                fallback.append("aspect_ratios")
+            if not costs and snap.costs:
+                costs = snap.costs
+                fallback.append("costs")
         merged.append(UpstreamModel(
             model_id=mid,
             display_name=str(m.get("display_name") or mid),
             max_support_image_count=m.get("max_images"),
             max_prompt_length=m.get("max_prompt"),
-            resolutions=tuple(i.get("resolutions") or ()),
-            default_resolutions=tuple(i.get("default_resolutions") or ()),
-            aspect_ratios=tuple(i.get("aspect_ratios") or ()),
-            default_aspect_ratios=tuple(i.get("default_aspect_ratios") or ()),
-            costs=tuple(i.get("costs") or ()),
+            resolutions=resolutions,
+            default_resolutions=default_res,
+            aspect_ratios=ratios,
+            default_aspect_ratios=ratio_defaults,
+            costs=costs,
             default_cost=i.get("default_cost"),
             tags=tuple(m.get("tags") or ()),
             mode=str(m.get("mode") or "image-reference"),
+            frozen_fallback=tuple(fallback),
         ))
     return merged
 
@@ -145,7 +173,13 @@ async def fetch_models(client: httpx.AsyncClient) -> tuple[list[UpstreamModel], 
                 f"该部分退回冻结快照。")
             logger.warning(f"能力表 {label} 读取失败：{type(e).__name__}: {e}")
 
-    return merge(meta, info), degradations
+    merged = merge(meta, info)
+    for m in merged:
+        if m.frozen_fallback:
+            degradations.append(
+                f"模型 {m.model_id} 的 {'/'.join(m.frozen_fallback)} 在运行期端点缺失 "
+                f"⇒ 退回冻结快照（{SNAPSHOT_DATE}）。")
+    return merged, degradations
 
 
 def coverage(models: Iterable[UpstreamModel]) -> dict[str, int]:

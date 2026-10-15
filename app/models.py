@@ -82,10 +82,20 @@ CAPABILITIES: tuple[Capability, ...] = (
 )
 
 #: 第三方 SDK 常硬编码的占位名 ⇒ 等价于"没写 model"，走默认推导。
+#: ⚠️ gpt-image / gpt-image-1 **不在**这里（2026-10-15）：gpt-image* 前缀
+#: 已被成本策略定向到 `GPT_IMAGE_CANONICAL`，占位名语义（落默认模型）
+#: 会跟它打架 —— 定向语义接管。
 PLACEHOLDER_MODELS: frozenset[str] = frozenset({
-    "auto", "dall-e-3", "dall-e-2", "gpt-image-1", "gpt-image", "flux", "sdxl",
+    "auto", "dall-e-3", "dall-e-2", "flux", "sdxl",
     "stable-diffusion", "seedream", "hailuo-video", "",
 })
+
+#: 🔴 成本策略定向（2026-10-15 用户口径）：`gpt-image*` 开头的 model **一律**
+#: 落到 flare —— 上游只按 flare 一个形态计费/出图（旧枚举 gpt-image-2 /
+#: 2.5-sunburst / 1.5 已无独立价值），调用方传的档位词汇按 build_plan 的
+#: 翻译表对齐后走"1K/low 生成 + CI 超分补齐"。
+GPT_IMAGE_CANONICAL = "gpt-image-2.5-flare"
+GPT_IMAGE_PREFIX = "gpt-image"
 
 #: 默认模型。**依据**：本项目唯一有端到端抓包证据的图生图模型
 #: （2026-09-21 抓包：1 张参考图 + `desc="a cat"` → 4096×4096 PNG，1K/2K/4K 分别 4/5/8 积分）。
@@ -120,6 +130,12 @@ class UpstreamModel:
     tags: tuple[str, ...] = ()
     #: 上游声明的 mode（`image-reference` / `subject-reference`）
     mode: str = "image-reference"
+    #: 🔴 哪些字段是运行期端点缺失后由**冻结快照补位**的
+    #: （2026-10-15 实测：上游 `video/model/info` 已不再返回
+    #: gpt-image-2.5-sunburst / gpt-image-2.5-flare 的条目，但网页前端
+    #: 仍用 resolution/quality 正常建任务 ⇒ 档位声明退回快照并留痕，
+    #: 静默补位等于让人对着过时数据校验却毫不知情）。
+    frozen_fallback: tuple[str, ...] = ()
 
     def cost_for(self, resolution: str, quality: str | None = None) -> float | None:
         """查该 (resolution, quality) 的真实单价。查不到返回 `None`（**不猜**）。
@@ -338,7 +354,13 @@ MODEL_ALIASES: dict[str, str] = {
 
 
 def canonical_model_id(raw: str) -> str:
-    """别名 → 规范 upstream modelID（非别名原样返回）。"""
+    """别名 → 规范 upstream modelID（非别名原样返回）。
+
+    🔴 `gpt-image*` 前缀**一律定向** `GPT_IMAGE_CANONICAL`（成本策略，
+    2026-10-15）—— 精确拼法（gpt-image-2.5-flare）原样通过。
+    """
+    if raw.startswith(GPT_IMAGE_PREFIX) and raw != GPT_IMAGE_CANONICAL:
+        return GPT_IMAGE_CANONICAL
     return MODEL_ALIASES.get(raw, raw)
 
 
@@ -362,6 +384,10 @@ def resolve_capability(value: str | None, *, has_image: bool) -> tuple[str, list
     if hit:
         return hit, []
 
+    if raw.startswith(GPT_IMAGE_PREFIX):
+        #: 成本策略定向目标恒在能力表（flare 由快照兜底）⇒ 前缀恒为已知，
+        #: 即使运行期清单波动也不把 gpt-image* 判成未知模型。
+        return ("hailuo-i2i" if has_image else "hailuo-t2i"), []
     known = {m.model_id for m in all_models()}
     if raw in known or raw in MODEL_ALIASES:
         # 上游模型 key（或其别名）：**原样透传，零映射、零说明**。
@@ -450,6 +476,8 @@ __all__ = [
     "PLACEHOLDER_MODELS",
     "REFERENCE_MODES",
     "SNAPSHOT_DATE",
+    "GPT_IMAGE_CANONICAL",
+    "GPT_IMAGE_PREFIX",
     "Capability",
     "UpstreamModel",
     "all_models",

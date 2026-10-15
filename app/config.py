@@ -172,6 +172,22 @@ class Settings:
     #: 上限受线程池钳制，不会随张数涨。1 = 退回串行（排障用）。
     ingest_parallelism: int = 4
 
+    # ------------------------------------------------------------ 超分（腾讯 CI）
+    #: 🔴 成本策略第二段（2026-10-15 用户口径）：gpt-image-* 上游**恒按最便宜档**
+    #: 生成（1K+low），调用方要的更高档位由腾讯云数据万象（CI）超分补齐。
+    #: 凭据一行式 `SECRET_ID|SECRET_KEY`（与 bfl 项目的 TENCENT_API_KEY 同格式，
+    #: 也可分写 TENCENT_SECRET_ID / TENCENT_SECRET_KEY）。
+    tencent_api_key: str = ""
+    #: 超分产物所在的 COS 桶（CI 处理直接作用在桶对象上）。
+    superres_bucket: str = ""
+    superres_region: str = "ap-singapore"
+    #: 总开关。**默认开**但未配凭据 ⇒ 自动回退原图并留痕（不会静默）。
+    superres_enabled: bool = True
+    #: CI 同步请求超时（秒）。bfl 实测 512²→1024² 秒级；给足余量。
+    superres_timeout: float = 90.0
+    #: 预签名 URL 有效期（秒）。24h：调用方（newapi 号池）拿到手还会转存。
+    superres_url_ttl: float = 86400.0
+
     # ------------------------------------------------------------ 可观测性
     otel_token: str = ""
     otel_service_name: str = "hailuo-service"
@@ -281,6 +297,16 @@ class Settings:
             normalize_max_bytes=_i("NORMALIZE_MAX_BYTES", 4 * 1024 * 1024),
             upload_cache_ttl=_f("UPLOAD_CACHE_TTL", 6 * 3600.0),
             ingest_parallelism=_i("INGEST_PARALLELISM", 4),
+            tencent_api_key=(
+                _s("TENCENT_API_KEY")
+                or (_s("TENCENT_SECRET_ID") + "|" + _s("TENCENT_SECRET_KEY")
+                    if _s("TENCENT_SECRET_ID") and _s("TENCENT_SECRET_KEY") else "")
+            ),
+            superres_bucket=_s("SUPERRES_BUCKET"),
+            superres_region=_s("SUPERRES_REGION", "ap-singapore"),
+            superres_enabled=_b("SUPERRES_ENABLED", True),
+            superres_timeout=_f("SUPERRES_TIMEOUT", 90.0),
+            superres_url_ttl=_f("SUPERRES_URL_TTL", 86400.0),
             otel_token=_s("LOGFIRE_TOKEN"),
             otel_service_name=_s("OTEL_SERVICE_NAME", "hailuo-service"),
             otel_environment=_s("LOGFIRE_ENVIRONMENT"),
