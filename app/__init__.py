@@ -3,6 +3,6 @@
 """hailuo-service 版本号 —— **单一事实源**（发版流程只改这里）。"""
 from __future__ import annotations
 
-__version__ = "0.0.10"
+__version__ = "0.0.11"
 
 __all__ = ["__version__"]
