@@ -119,7 +119,9 @@ function renderTable() {
     tdWeight.textContent = String(acc.weight);
 
     const tdUse = document.createElement("td");
-    tdUse.textContent = String(acc.use_count ?? 0);
+    // 取号次数 / 出图张数 —— 两个口径，不能混
+    tdUse.textContent = `${acc.use_count ?? 0} / ${acc.generations ?? 0}`;
+    tdUse.title = "取号次数 / 出图成功张数";
 
     const tdCheck = document.createElement("td");
     const t = document.createElement("span");

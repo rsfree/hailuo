@@ -155,3 +155,17 @@ def test_pick_skips_busy_accounts(accounts: AccountStore, cipher: AccountCipher)
     assert accounts.pick(busy_fps={a["fp"]})["id"] == b["id"]
     both = accounts.pick(busy_fps={a["fp"], b["fp"]})
     assert both["id"] in (a["id"], b["id"]), "全忙时必须退回，不能返回 None"
+
+
+def test_caller_token_roundtrip_and_expiry(accounts: AccountStore,
+                                           cipher: AccountCipher) -> None:
+    """透传 token 的密文存取：能取回、过期即删、库里没有明文。"""
+    accounts.remember_caller("fp-live", FAKE_JWT, exp=None, cipher=cipher)
+    assert accounts.recall_caller("fp-live", cipher) == FAKE_JWT
+
+    raw = accounts.engine.connect().exec_driver_sql(
+        "select token_enc from caller_tokens where fp='fp-live'").scalar()
+    assert FAKE_JWT not in raw and raw.startswith("v1.")
+
+    accounts.remember_caller("fp-old", FAKE_JWT, exp=1.0, cipher=cipher)
+    assert accounts.recall_caller("fp-old", cipher) is None

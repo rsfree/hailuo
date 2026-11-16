@@ -168,7 +168,9 @@ class Settings:
     #: 同步接口 `POST /v1/images/generations`（创建+轮询合并）的**总等待预算**（秒）：
     #: 预算内到终态直接给结果；耗尽仍在跑 ⇒ 202 + task_id 无缝转异步轮询
     #:（任务不取消，协调器继续推进）。图片实测最慢档 ~124s ⇒ 300s 足够覆盖。
-    sync_max_wait: float = 300.0
+    #: 同步端点的等待预算。**240 而不是 300**：网关（nginx）常见读超时 300~320s，
+    #: 若预算贴到 300，抖动时调用方会先拿到 504 —— 而任务其实已建到上游（钱花了、id 没拿到）。
+    sync_max_wait: float = 240.0
     #: 同步端点的**并发等待上限**（信号量，进程内）。同步等待阻塞线程池线程
     #:（anyio 默认 40）⇒ 用硬护栏把最坏占用钉死，槽满 **429 秒回**（带 Retry-After），
     #: 绝不让慢请求把线程池吃光而殃及其他请求。8 = 常规号池场景绰绰有余。
@@ -279,6 +281,10 @@ class Settings:
     account_enc_key: str = ""
     #: 池化出号的服务端 Key（逗号分隔）。空 ⇒ 只支持透传（与旧行为完全一致）。
     service_keys: tuple[str, ...] = ()
+    #: 是否把**透传调用方**的 token 加密落库（默认开）。
+    #: 关了 ⇒ 重启后在途透传任务无法恢复（旧行为）；开了 ⇒ 库里有密文，
+    #: 主密钥泄露的后果从"你自己的号"扩大到"所有调用方的号"。这是一个安全取舍。
+    store_caller_tokens: bool = True
     #: 服务自身 TLS 证书/私钥路径。**必须成对**：缺一个就启动失败，
     #: 不做"看着像开了其实没开"的半吊子配置。不配则由网关终结 TLS。
     tls_certfile: str = ""
@@ -368,7 +374,7 @@ class Settings:
             hl_per_minute=_i("HL_PER_MINUTE", 0),
             hl_cooldown=_f("HL_COOLDOWN", 600.0),
             submit_max_attempts=_i("SUBMIT_MAX_ATTEMPTS", 3),
-            sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),
+            sync_max_wait=_f("SYNC_MAX_WAIT", 240.0),
             sync_max_concurrency=_i("SYNC_MAX_CONCURRENCY", 8),
             hailuo_poll_interval=_f("HAILUO_POLL_INTERVAL", 5.0),
             poll_grace=_f("POLL_GRACE", 0.5),
@@ -418,6 +424,7 @@ class Settings:
             #: 命名约定见 `parse_service_keys`：**一个服务一个 key**，名字 = `sk-`+二级域名。
             #: 新变量名 `HAILUO_API_KEYS` 对齐 `*_API_KEYS` 约定；`SERVICE_KEYS` 保留兼容。
             service_keys=_csv("HAILUO_API_KEYS") or _csv("SERVICE_KEYS"),
+            store_caller_tokens=_b("STORE_CALLER_TOKENS", True),
             tls_certfile=_s("TLS_CERTFILE"),
             tls_keyfile=_s("TLS_KEYFILE"),
         )
@@ -433,6 +440,12 @@ class Settings:
             raise ConfigError("SUBMIT_MAX_ATTEMPTS 必须 >= 1")
         if self.task_timeout <= 0:
             raise ConfigError("TASK_TIMEOUT 必须 > 0")
+        if self.sync_max_wait > 240.0:
+            self.startup_warnings.append(
+                f"SYNC_MAX_WAIT={self.sync_max_wait:.0f}s 超过建议上限 240s："
+                "网关读超时通常 300s 左右，贴边时调用方会先收到 504，"
+                "而任务已在上游计费运行（id 丢失）。建议 ≤240s，"
+                "或用异步端点 + 轮询。")
         if self.sync_max_wait <= 0:
             raise ConfigError("SYNC_MAX_WAIT 必须 > 0")
         if self.sync_max_concurrency < 1:

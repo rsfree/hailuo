@@ -79,6 +79,15 @@ class PoolAuth:
     def resolve(self, key: str) -> Caller:
         if key.count(".") == 2:
             cred = self.service.register_credential(key)
+            #: 透传 token 加密落库（默认开）⇒ 进程重启后在途任务仍能恢复。
+            #: 任何存储异常都**不许影响鉴权**：这是"锦上添花"，不是前置条件。
+            if self.settings.store_caller_tokens and self.cipher is not None:
+                try:
+                    claims = parse_jwt(key)
+                    self.accounts.remember_caller(
+                        cred, key, exp=getattr(claims, "exp", None), cipher=self.cipher)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"透传 token 落库失败（不影响本次请求）：{e}")
             return Caller(credential_id=cred, owner_id=cred)
         spec = self.spec_of(key)
         if spec is None:

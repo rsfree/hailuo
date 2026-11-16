@@ -389,6 +389,16 @@ HAILUO_API_KEYS=tenant-a:sk-aaa:200,tenant-b:sk-bbb
 - HTTPS（或 `X-Forwarded-Proto: https`）下会话 Cookie 自动加 `Secure`；
   `ADMIN_TOKEN` 已配但既无证书又走明文 ⇒ **启动告警**，不静默。
 
+**凭据留存（2026-11-17 起）**：
+
+- **池化账号**：token 以 AES-256-GCM 密文存 `accounts`，任务只记指纹
+  ⇒ 进程重启后按指纹解密恢复，在途任务不断；
+- **透传调用方**：默认 `STORE_CALLER_TOKENS=1`，把调用方 JWT 加密存 `caller_tokens`
+  （按指纹去重，TTL = JWT 的 `exp`，过期即删）。**这是一次安全取舍**：
+  库里有了调用方 token 的密文，主密钥泄露的影响面从"你自己的号"扩大到"所有调用方"。
+  要回到"永不落库"请设 `STORE_CALLER_TOKENS=0`，代价是重启后透传任务明确失败。
+- 两种情况都**只存密文**，任何接口/面板都不回显明文。
+
 **产物下载**：脚本对 CDN 建连抖动做 4 次退避重试，并校验状态码 + 魔术字节
 （CDN 出错会回 HTML，存成 .png 报"成功"是最坏的一种谎报）。
 

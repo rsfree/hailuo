@@ -47,6 +47,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from loguru import logger
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import (
     Float,
     Index,
@@ -424,16 +425,28 @@ class TaskStore:
         """配额预扣：**检查与自增在同一个事务**里。
 
         `limit<=0` ⇒ 不限（仍然记一行用量，便于面板看趋势）。
-        并发下（多 worker）可能极小概率多放过一两条：这里没有行锁；
-        SQLite 写事务本身就是串行的，Postgres 部署如需严格上限应改成
-        `SELECT … FOR UPDATE`。**不假装它是硬的**。
+
+        ## 并发下的严格性
+
+        - **Postgres**：`SELECT … FOR UPDATE` 锁住该行 ⇒ 多 worker 也不会超发；
+        - **SQLite**：写事务本身串行，无需行锁；
+        - 首插竞争（两个请求同时发现"今天还没有行"）：用 UPSERT 的
+          `ON CONFLICT DO NOTHING` 语义兜住，再回头取锁。
         """
+        lock = self.engine.dialect.name != "sqlite"
         with self.session() as s:
-            row = s.get(KeyUsageRow, (owner_id, day))
+            row = s.get(KeyUsageRow, (owner_id, day), with_for_update=lock)
             if row is None:
-                row = KeyUsageRow(owner_id=owner_id, day=day, requests=0)
-                s.add(row)
-                s.flush()
+                try:
+                    with s.begin_nested():
+                        s.add(KeyUsageRow(owner_id=owner_id, day=day, requests=0))
+                        s.flush()
+                except IntegrityError:
+                    #: 另一个 worker 刚好插进去了 —— 回滚到 savepoint，继续抢锁
+                    pass
+                row = s.get(KeyUsageRow, (owner_id, day), with_for_update=lock)
+            if row is None:  # pragma: no cover —— 插入失败且读不到，只能保守拒绝
+                return False
             if limit > 0 and row.requests + requests > limit:
                 return False
             row.requests += requests
@@ -454,6 +467,15 @@ class TaskStore:
         out = {str(st): int(n) for st, n in rows}
         out["total"] = sum(out.values())
         return out
+
+    def succeeded_counts_by_credential(self) -> dict[str, int]:
+        """每个账号**出图成功**的任务数（面板区分"取号次数"与"真的出了图"）。"""
+        with self.session() as s:
+            rows = s.execute(
+                select(self.row_cls.credential_id, func.count())
+                .where(self.row_cls.status == ST_SUCCEEDED)
+                .group_by(self.row_cls.credential_id)).all()
+        return {(cred or ""): int(n) for cred, n in rows}
 
     def count_queued(self) -> int:
         with self.session() as s:

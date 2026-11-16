@@ -351,7 +351,21 @@ class Service:
             return False
         rec = accounts.get_by_fp(fingerprint)
         if rec is None:
-            return False
+            #: 不是号池账号 ⇒ 可能是**透传调用方**：库里有它的 token 密文就能恢复
+            try:
+                token = accounts.recall_caller(fingerprint, cipher)
+            except ValueError as e:
+                logger.warning(f"调用方 token 解密失败（{fingerprint[:8]}…）：{e}")
+                return False
+            if not token:
+                return False
+            try:
+                self.credentials.put(fingerprint, token, parse_jwt(token))
+            except (AuthError, ValueError) as e:
+                logger.warning(f"调用方 token 已过期/非法（{fingerprint[:8]}…）：{e}")
+                return False
+            logger.info(f"凭据已从**调用方密文**恢复：{fingerprint[:8]}…")
+            return True
         try:
             token = accounts.token_of(rec["id"], cipher)
             if not token:

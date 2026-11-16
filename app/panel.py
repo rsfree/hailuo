@@ -187,7 +187,13 @@ def install_panel(app: FastAPI, *, settings: Any, service: Any,
     @app.get("/panel/api/accounts", include_in_schema=False)
     def list_accounts(request: Request) -> dict[str, Any]:
         guard(request)
-        return {"accounts": accounts.list()}
+        #: `use_count` 是**取号次数**（每次鉴权都 +1，含读列表）；真正"出了几张图"
+        #: 要按任务表算。两者混在一个数字里会让人以为"没调用却消耗了额度"。
+        generated = service.store.succeeded_counts_by_credential()
+        rows = accounts.list()
+        for r in rows:
+            r["generations"] = generated.get(r["fp"], 0)
+        return {"accounts": rows}
 
     @app.post("/panel/api/accounts", include_in_schema=False)
     def create_account(body: AccountBody, request: Request) -> dict[str, Any]:

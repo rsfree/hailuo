@@ -230,21 +230,58 @@ def test_credential_rehydrates_from_pool_after_restart(pool, fake) -> None:
     assert svc.credentials.get(cred) is not None, "恢复后应重新入池"
 
 
-def test_passthrough_credential_is_not_rehydrated(settings, store, fake) -> None:
-    """透传 token 不落库 ⇒ 重启后仍应明确失败，不能凭空变出凭据。
+def test_passthrough_recovers_from_encrypted_token(settings, store, fake) -> None:
+    """透传 token **加密落库**（默认开）⇒ 重启后在途任务仍能恢复。
 
     ⚠️ 必须用 **HTTP 模式**的 Service：`service` 夹具注入了 client（嵌入模式），
     那条路根本不查凭据池，测不到这里的行为。
     """
-    from app.errors import CredentialUnavailable
     from app.main import create_app
 
-    svc = _http_service(settings, store, fake)
-    client = TestClient(create_app(settings, service=svc))
+    st = settings.replace(account_enc_key=KEY, store_caller_tokens=True)
+    svc = _http_service(st, store, fake)
+    client = TestClient(create_app(st, service=svc))
     r = client.post("/async/v1/images/generations", json=BODY,
                     headers={"Authorization": f"Bearer {FAKE_JWT}"})
     task_id = r.json()["task_id"]
     cred = svc.store.get_full(task_id)["credential_id"]
-    svc.credentials.forget(cred)
+
+    svc.credentials.forget(cred)          # 模拟重启
+    out = svc.submit(task_id)
+    assert out["submitted"] is True
+    assert fake.tokens_seen[-1] == FAKE_JWT
+
+
+def test_passthrough_fails_when_storage_disabled(settings, store, fake) -> None:
+    """关掉落库 ⇒ 行为回到旧样子：明确失败，绝不臆造凭据。"""
+    from app.errors import CredentialUnavailable
+    from app.main import create_app
+
+    st = settings.replace(account_enc_key=KEY, store_caller_tokens=False)
+    svc = _http_service(st, store, fake)
+    client = TestClient(create_app(st, service=svc))
+    r = client.post("/async/v1/images/generations", json=BODY,
+                    headers={"Authorization": f"Bearer {FAKE_JWT}"})
+    task_id = r.json()["task_id"]
+    svc.credentials.forget(svc.store.get_full(task_id)["credential_id"])
     with pytest.raises(CredentialUnavailable):
         svc.submit(task_id)
+
+
+def test_caller_token_is_stored_as_ciphertext(settings, store, fake) -> None:
+    """库里只许有密文；明文 JWT 一个字节都不许出现。"""
+    from app.main import create_app
+
+    st = settings.replace(account_enc_key=KEY, store_caller_tokens=True)
+    svc = _http_service(st, store, fake)
+    client = TestClient(create_app(st, service=svc))
+    client.post("/async/v1/images/generations", json=BODY,
+                headers={"Authorization": f"Bearer {FAKE_JWT}"})
+    raw = "\n".join(
+        f"{r[0]}|{r[1]}|{r[2]}"
+        for r in store.engine.connect().exec_driver_sql(
+            "select fp, token_enc, exp from caller_tokens").fetchall())
+    assert raw, "应当写入 caller_tokens"
+    assert FAKE_JWT not in raw, "明文 token 不许落库"
+    assert "v1." in raw, "应存信封密文"
+

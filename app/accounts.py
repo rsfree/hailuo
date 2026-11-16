@@ -159,6 +159,21 @@ def view(row: AccountRow, *, now: float | None = None) -> dict[str, Any]:
     }
 
 
+class CallerTokenRow(Base):
+    """**透传**调用方的 token 密文（重启后恢复在途任务用）。
+
+    为什么不按任务存：token 与任务是一对多，按指纹存一份即可，避免同一密文复制 N 份。
+    `exp` 来自 JWT 自身声明，到期即视为不可用（并在读取时顺手删除）。
+    """
+
+    __tablename__ = "caller_tokens"
+
+    fp: Mapped[str] = mapped_column(String(64), primary_key=True)
+    token_enc: Mapped[str] = mapped_column(Text, default="")
+    exp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class AccountStore:
     """账号表。与任务表**共用一个引擎**（`create_app` 里传进来），不另开连接池。"""
 
@@ -305,6 +320,42 @@ class AccountStore:
             rows = s.scalars(select(AccountRow).order_by(
                 AccountRow.created_at, AccountRow.id)).all()
             return [view(r, now=now) for r in rows]
+
+    def remember_caller(self, fp: str, token: str, *, exp: float | None,
+                        cipher: AccountCipher) -> None:
+        """把**透传调用方**的 token 加密存下（仅此一处落库，且只存密文）。"""
+        now = time.time()
+        enc = cipher.encrypt(token)
+        with Session(self.engine) as s:
+            row = s.get(CallerTokenRow, fp)
+            if row is None:
+                s.add(CallerTokenRow(fp=fp, token_enc=enc, exp=exp, updated_at=now))
+            else:
+                row.token_enc, row.exp, row.updated_at = enc, exp, now
+            s.commit()
+
+    def recall_caller(self, fp: str, cipher: AccountCipher,
+                      *, now: float | None = None) -> str | None:
+        """取回调用方 token；**过期即删并返回 None**，解密失败抛（不静默）。"""
+        now = time.time() if now is None else now
+        with Session(self.engine) as s:
+            row = s.get(CallerTokenRow, fp)
+            if row is None:
+                return None
+            if row.exp is not None and row.exp <= now:
+                s.delete(row)
+                s.commit()
+                return None
+            return cipher.decrypt(row.token_enc)
+
+    def purge_expired_callers(self, *, now: float | None = None) -> int:
+        now = time.time() if now is None else now
+        with Session(self.engine) as s:
+            n = s.query(CallerTokenRow).filter(
+                CallerTokenRow.exp.is_not(None), CallerTokenRow.exp <= now
+            ).delete(synchronize_session=False)
+            s.commit()
+            return int(n or 0)
 
     def token_of(self, account_id: str, cipher: AccountCipher) -> str | None:
         """取出**明文** token —— 仅供选号后登记进内存池，绝不返回给调用方。"""
