@@ -26,9 +26,11 @@ BODY = {"model": "nano_banana21_flash", "prompt": "x", "n": 1, "resolution": "1K
 
 
 def test_parse_specs() -> None:
-    specs = parse_service_keys(("tenant-a:sk-a:2", "sk-plain", "t:sk-b:0"))
+    specs = parse_service_keys(("tenant-a:sk-a:2", "sk-plain", "t:sk-b:0", "sk-hailuo"))
     assert specs["sk-a"] == ("tenant-a", 2)
-    assert specs["sk-plain"] == ("", 0), "纯 key ⇒ 无标签、无限额"
+    #: 规则：`sk-` + 二级域名 ⇒ 标签自动推导（`sk-plain` → `plain`），且不限量
+    assert specs["sk-plain"] == ("plain", 0)
+    assert specs["sk-hailuo"] == ("hailuo", 0)
     assert specs["sk-b"] == ("t", 0), "0 = 不限"
 
 
@@ -91,3 +93,16 @@ def test_usage_rolls_over_daily(store) -> None:
     assert store.consume_quota("owner", "2026-11-17", limit=1) is True
     assert store.consume_quota("owner", "2026-11-17", limit=1) is False
     assert store.consume_quota("owner", "2026-11-18", limit=1) is True, "跨天必须归零"
+
+
+def test_env_uses_hailuo_api_keys(monkeypatch) -> None:
+    """变量名对齐 `*_API_KEYS` 约定；旧名 `SERVICE_KEYS` 仍兼容。"""
+    monkeypatch.delenv("SERVICE_KEYS", raising=False)
+    monkeypatch.setenv("HAILUO_API_KEYS", "sk-hailuo")
+    st = Settings.from_env()
+    assert st.service_keys == ("sk-hailuo",)
+    assert parse_service_keys(st.service_keys)["sk-hailuo"] == ("hailuo", 0)
+
+    monkeypatch.delenv("HAILUO_API_KEYS", raising=False)
+    monkeypatch.setenv("SERVICE_KEYS", "sk-legacy")
+    assert Settings.from_env().service_keys == ("sk-legacy",)

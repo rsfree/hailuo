@@ -65,13 +65,19 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 
 
 def parse_service_keys(raw: tuple[str, ...] | list[str]) -> dict[str, tuple[str, int]]:
-    """`SERVICE_KEYS` → `{key: (label, quota_per_day)}`。
+    """`HAILUO_API_KEYS`（兼容旧名 `SERVICE_KEYS`）→ `{key: (label, quota_per_day)}`。
 
-    写法：`label:key:quota`（quota=0 或省略 ⇒ 不限）。**纯 key 仍然可用**，
-    老配置不会被这次改动弄坏。
+    ## Key 的命名规则（用户口径，2026-11-17）
 
-    键里**不允许出现冒号**：这是格式约束，不是安全策略 —— 出现冒号就没法
-    无歧义地解析，宁可启动就说明白。
+    **`sk-` + 二级域名**，直接拼、不加前后缀：`hailuo.1task.cn` ⇒ `sk-hailuo`。
+    一个服务一个 key，不用全局万能 key；多把时**同名变量、逗号分隔**。
+
+    ## 写法
+
+    · `sk-hailuo`              —— **推荐**：标签自动从 key 推导（`hailuo`），不限量；
+    · `label:key` / `label:key:quota` —— 需要显式标签/每日配额时才用（独立部署/租户）。
+
+    key 与标签里都不许出现冒号 —— 出现就没法无歧义解析，宁可在启动时说清楚。
     """
     out: dict[str, tuple[str, int]] = {}
     for item in raw or ():
@@ -82,7 +88,11 @@ def parse_service_keys(raw: tuple[str, ...] | list[str]) -> dict[str, tuple[str,
         #: 段数决定语义（必须无歧义）：1 段=纯 key；2 段=标签:Key（不限）；3 段=标签:Key:配额。
         #: 因此 **Key 与标签里都不许出现冒号** —— 出现就没法解析，宁可在启动时说清楚。
         if len(parts) == 1:
-            out[parts[0]] = ("", 0)
+            key = parts[0]
+            #: 规则：key 形如 `sk-hailuo` ⇒ 标签 `hailuo`（服务身份直接体现在 key 里，
+            #: 面板与报错不必再让运维手填一遍）。不符合 `sk-` 前缀的保持无标签。
+            label = key[3:] if key.startswith("sk-") else ""
+            out[key] = (label if _LABEL_RE.match(label) else "", 0)
             continue
         if len(parts) not in (2, 3):
             raise ValueError(
@@ -395,7 +405,9 @@ class Settings:
 
             admin_token=_s("ADMIN_TOKEN"),
             account_enc_key=_s("ACCOUNT_ENC_KEY"),
-            service_keys=_csv("SERVICE_KEYS"),
+            #: 命名约定见 `parse_service_keys`：**一个服务一个 key**，名字 = `sk-`+二级域名。
+            #: 新变量名 `HAILUO_API_KEYS` 对齐 `*_API_KEYS` 约定；`SERVICE_KEYS` 保留兼容。
+            service_keys=_csv("HAILUO_API_KEYS") or _csv("SERVICE_KEYS"),
             tls_certfile=_s("TLS_CERTFILE"),
             tls_keyfile=_s("TLS_KEYFILE"),
         )

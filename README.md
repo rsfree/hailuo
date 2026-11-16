@@ -336,11 +336,23 @@ curl -s localhost:8300/panel                        # 浏览器打开即可
 **选号判据**：`active` + 未过期 + 不在冷却，按 **权重降序 → 最久未用 → 最早到期** 取第一个。
 最早到期者先用，是为了不让快到期的余额烂在库里。
 
-**服务 Key 的标签与每日配额**：
+**服务 Key 的命名规则**（用户口径，2026-11-17）：
+
+**`sk-` + 二级域名**，直接拼、不加前后缀：`hailuo.1task.cn` ⇒ `sk-hailuo`。
+一个服务一个 key，不用全局万能 key；多把时**同名变量、逗号分隔**。
+写进该服务的 `.env`，**不入库、不进 README**。
+
+```bash
+HAILUO_API_KEYS=sk-hailuo          # 标签自动推导为 hailuo
+# 多把（同名变量、逗号分隔）：
+# HAILUO_API_KEYS=sk-hailuo,sk-hailuo-2
+```
+
+**需要配额时才用扩展写法**（Key 与标签里都不许出现冒号）：
 
 ```
-SERVICE_KEYS=tenant-a:sk-aaa:200,tenant-b:sk-bbb,sk-plain
-#             └标签┘ └Key┘ └日配额┘  └标签:Key┘  └纯 key（不限）
+HAILUO_API_KEYS=tenant-a:sk-aaa:200,tenant-b:sk-bbb
+#                └标签┘ └Key┘ └日配额┘  └标签:Key┘
 ```
 
 - 配额单位是**每日受理次数**，不是积分：`forecast_credits` 对部分模型可能为空，
