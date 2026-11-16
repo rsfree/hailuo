@@ -389,6 +389,18 @@ HAILUO_API_KEYS=tenant-a:sk-aaa:200,tenant-b:sk-bbb
 - HTTPS（或 `X-Forwarded-Proto: https`）下会话 Cookie 自动加 `Secure`；
   `ADMIN_TOKEN` 已配但既无证书又走明文 ⇒ **启动告警**，不静默。
 
+**上游对账（2026-11-17 起）**：
+
+建任务请求发出、上游已受理并计费，但响应丢在网络上（或进程恰在此刻被杀）
+⇒ 本地只有 `attempts`、没有 `upstream_batch_id`。这是**唯一会造成资损**的路径：
+调用方看到"失败"，钱和产物都白扔。
+
+协调器每 `RECONCILE_INTERVAL`（默认 300s）跑一次，判据四条**同时**成立：
+批次未被任何本地任务占用 / `model_id` 相同 / `desc` 与 prompt 逐字相同 /
+批次创建时间与本地提交时间偏差 ≤ `RECONCILE_WINDOW`（默认 180s）。
+**命中唯一才认领**，多个记 `ambiguous` 放弃 —— 错认的代价（把别人的图交给你）
+远大于晚一点交付。面板 `POST /panel/api/reconcile` 可手动触发。
+
 **凭据留存（2026-11-17 起）**：
 
 - **池化账号**：token 以 AES-256-GCM 密文存 `accounts`，任务只记指纹

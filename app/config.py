@@ -281,6 +281,15 @@ class Settings:
     account_enc_key: str = ""
     #: 池化出号的服务端 Key（逗号分隔）。空 ⇒ 只支持透传（与旧行为完全一致）。
     service_keys: tuple[str, ...] = ()
+    #: 上游对账：把"请求已发出但响应丢失"的孤儿批次认回来（默认开）。
+    #: 关掉 ⇒ 这类任务只能人工处理（钱花了、id 没拿到）。
+    reconcile_enabled: bool = True
+    #: 每隔多久扫一次（秒）；太密会白白打上游。
+    reconcile_interval: float = 300.0
+    #: 只回看最近多久内提交的任务（秒）。
+    reconcile_lookback: float = 1800.0
+    #: 批次创建时间与本地提交时间的允许偏差（秒）。超过就不认。
+    reconcile_window: float = 180.0
     #: 是否把**透传调用方**的 token 加密落库（默认开）。
     #: 关了 ⇒ 重启后在途透传任务无法恢复（旧行为）；开了 ⇒ 库里有密文，
     #: 主密钥泄露的后果从"你自己的号"扩大到"所有调用方的号"。这是一个安全取舍。
@@ -424,6 +433,10 @@ class Settings:
             #: 命名约定见 `parse_service_keys`：**一个服务一个 key**，名字 = `sk-`+二级域名。
             #: 新变量名 `HAILUO_API_KEYS` 对齐 `*_API_KEYS` 约定；`SERVICE_KEYS` 保留兼容。
             service_keys=_csv("HAILUO_API_KEYS") or _csv("SERVICE_KEYS"),
+            reconcile_enabled=_b("RECONCILE_ENABLED", True),
+            reconcile_interval=_f("RECONCILE_INTERVAL", 300.0),
+            reconcile_lookback=_f("RECONCILE_LOOKBACK", 1800.0),
+            reconcile_window=_f("RECONCILE_WINDOW", 180.0),
             store_caller_tokens=_b("STORE_CALLER_TOKENS", True),
             tls_certfile=_s("TLS_CERTFILE"),
             tls_keyfile=_s("TLS_KEYFILE"),

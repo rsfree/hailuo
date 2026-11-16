@@ -78,6 +78,8 @@ class Coordinator:
         #: 视频协调器传 `VIDEO_POLL_INTERVAL`（默认 10s）⇒ 一轮 tick 最多问一次上游。
         self.poll_interval = poll_interval
         self._last_poll_at = 0.0
+        #: 上次对账时间（`RECONCILE_INTERVAL` 节流用）
+        self._last_reconcile = 0.0
         #: 受理路径用它叫醒协调器（纯优化：唤醒丢了只是慢一个 tick，
         #: "该派发谁"始终由库里的状态决定）
         self._wake = threading.Event()
@@ -142,6 +144,26 @@ class Coordinator:
 
     # ------------------------------------------------------------------ 单轮
 
+    def _maybe_reconcile(self) -> None:
+        """按 `RECONCILE_INTERVAL` 节流跑对账。**任何异常都不许打断主循环**。
+
+        对账是"补救"而不是"主链路"：它失败只意味着丢单还没被认回来，
+        不该让整个协调器停摆。
+        """
+        if not self.settings.reconcile_enabled:
+            return
+        now = time.time()
+        if now - self._last_reconcile < self.settings.reconcile_interval:
+            return
+        self._last_reconcile = now
+        try:
+            stats = self.service.reconcile()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"上游对账失败（不影响主循环）：{e}")
+            return
+        if stats.get("adopted") or stats.get("ambiguous") or stats.get("errors"):
+            logger.warning(f"上游对账：{stats}")
+
     def tick(self) -> CoordinatorStats:
         """一轮。
 
@@ -164,6 +186,9 @@ class Coordinator:
         if expired:
             self.stats.expired += len(expired)
             logger.warning(f"看门狗收掉 {len(expired)} 个超时任务：{expired}")
+
+        # ②.5 上游对账（低频）：把"已建到上游、但没记下 batch id"的任务认回来
+        self._maybe_reconcile()
 
         # ③ 批量轮询（**一次上游查询**；`poll_interval > 0` 时按间隔节流）
         in_flight = self.service.store.in_flight()

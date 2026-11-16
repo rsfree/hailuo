@@ -1111,6 +1111,90 @@ class Service:
 
     # ------------------------------------------------------------------ 轮询
 
+    def reconcile(self, *, lookback: float | None = None,
+                  window: float | None = None, limit: int = 100) -> dict[str, Any]:
+        """**上游对账**：把"已建到上游、但本地没记下 batch id"的任务认回来。
+
+        ## 为什么必须做
+
+        建任务请求发出去、上游已受理并计费，但响应在网络上丢了（或进程恰在此刻被杀）
+        ⇒ 本地只有 `attempts` 没有 `batch_id`。若不处理：调用方拿到"失败"，
+        钱白花、图白生成。这是唯一一条**真实会造成资损**的路径。
+
+        ## 认领判据（四条同时成立，少一条都不认）
+
+        1. 批次**未被任何本地任务占用**（一图不许认两个任务）；
+        2. `model_id` 与任务的 `upstream_model` 完全相同；
+        3. `desc` 与提交的 prompt **逐字相同**（去首尾空白、大小写折叠）；
+        4. 批次创建时间与本地 `submitted_at` 的偏差 ≤ `window`。
+
+        命中**恰好一个**才认领；0 个记 `unmatched`，多个记 `ambiguous`（宁可漏认，
+        不许错认 —— 把别人的图交给你的代价远大于晚一点交付）。
+        """
+        lookback = self.settings.reconcile_lookback if lookback is None else lookback
+        window = self.settings.reconcile_window if window is None else window
+        since = time.time() - max(60.0, lookback)
+        orphans = self.store.orphans_without_batch(since=since, limit=limit)
+        stats: dict[str, Any] = {"scanned": len(orphans), "adopted": 0,
+                                 "ambiguous": 0, "unmatched": 0, "errors": 0}
+        if not orphans:
+            return stats
+
+        by_cred: dict[str, list[dict[str, Any]]] = {}
+        for t in orphans:
+            by_cred.setdefault(t.get("credential_id") or "", []).append(t)
+
+        for cred, group in by_cred.items():
+            try:
+                client, _uploader = self.clients_for(cred)
+                batches, _trace = client.fetch_batches(limit=50, feed_types=[1])
+            except AdapterError as e:
+                stats["errors"] += len(group)
+                logger.warning(f"对账跳过（凭据 {cred[:8]}… 不可用）：{e}")
+                continue
+            claimed = self.store.claimed_batch_ids([bid for bid, _ in batches])
+            for task in group:
+                request = task.get("request") or {}
+                want_prompt = self._norm_prompt(str(request.get("prompt") or ""))
+                want_model = task.get("upstream_model") or ""
+                submitted = task.get("submitted_at") or 0.0
+                hits: list[tuple[str, list[Feed]]] = []
+                for bid, feeds in batches:
+                    if bid in claimed:
+                        continue
+                    f0 = feeds[0] if feeds else None
+                    if f0 is None:
+                        continue
+                    if f0.model_id != want_model:
+                        continue
+                    if self._norm_prompt(f0.desc) != want_prompt or not want_prompt:
+                        continue
+                    if abs((f0.create_time or 0) / 1000.0 - submitted) > window:
+                        continue
+                    hits.append((bid, feeds))
+                if not hits:
+                    stats["unmatched"] += 1
+                    continue
+                if len(hits) > 1:
+                    stats["ambiguous"] += 1
+                    logger.warning(
+                        f"对账歧义：任务 {task['task_id']} 命中 {len(hits)} 个批次，放弃认领")
+                    continue
+                bid, feeds = hits[0]
+                claimed.add(bid)
+                self.store.update_task(task["task_id"], upstream_batch_id=bid)
+                self._apply_feeds(task["task_id"], feeds)
+                stats["adopted"] += 1
+                logger.warning(
+                    f"对账认领：任务 {task['task_id']} ← 批次 {bid}"
+                    f"（原状态 {task['status']}，上游确有产物，避免了一次丢单）")
+                OBS.event("task.reconciled", task_id=task["task_id"], batch_id=bid)
+        return stats
+
+    @staticmethod
+    def _norm_prompt(text: str) -> str:
+        return " ".join((text or "").split()).casefold()
+
     def poll_many(self, tasks: list[dict[str, Any]], *,
                   dry_run: bool = False) -> dict[str, Any]:
         """推进全部在途任务；**按凭据分组**，每组用各自的客户端查。

@@ -130,6 +130,8 @@ class FakeHailuo:
         self.feed_status: dict[str, int] = {}
         #: batch_id -> 产物 URL
         self.feed_url: dict[str, str] = {}
+        #: batch_id -> 建任务时的真实元信息（对账要按 prompt/model/时间匹配）
+        self.feed_meta: dict[str, dict[str, Any]] = {}
         #: batch_id -> v4 点名直查要回的 asset（与 `my/batch` 窗口**互相独立**）
         self.v4_batches: dict[str, dict[str, Any]] = {}
         #: 🔴 batch_id -> **视频** feed 规格（`my/batch` + `feedTypes=[0]` 形态）。
@@ -307,6 +309,14 @@ class FakeHailuo:
             batch_id = f"55812{next(self._seq):015d}"
             record_id = f"55813{next(self._seq):015d}"
             self.set_feed(batch_id)
+            #: 🔴 对账测试依赖真实元信息：假上游若永远回 "a cat"，
+            #: 就测不出"按 prompt 精确匹配"这条判据
+            param = (body.get("parameter") or {}) if isinstance(body, dict) else {}
+            self.feed_meta[batch_id] = {
+                "model": str(param.get("modelID") or ""),
+                "desc": str(param.get("desc") or ""),
+                "create_time": int(time.time() * 1000),
+            }
             # 🔴 真实形态（2026-09-21 实测）：`data.id` 是 **feed 记录 id**，
             # `data.task.batchID` 才是轮询用的批次 id —— 两个值必须不同，
             # 否则测试会放过"拿错 id 导致永远查不到任务"这类缺陷。
@@ -342,14 +352,16 @@ class FakeHailuo:
                             "total": len(self.video_feeds)})
             feeds = []
             for batch_id, status in self.feed_status.items():
+                meta = self.feed_meta.get(batch_id) or {}
+                ct = int(meta.get("create_time") or 1789922888112)
                 feeds.append({
                     "batchID": batch_id,
-                    "batchCreateTime": 1789922888112,
+                    "batchCreateTime": ct,
                     "feedType": 1,
                     "feeds": [{
                         "feedType": 1,
                         "commonInfo": {"id": f"feed-{batch_id}", "batchID": batch_id,
-                                       "createTime": 1789922888112, "status": status,
+                                       "createTime": ct, "status": status,
                                        "humanCheckStatus": 0, "postStatus": 0},
                         "permissionInfo": {"canRetry": False},
                         "feedCoverInfo": {"coverURL": "https://cdn/cover.png",
@@ -358,7 +370,8 @@ class FakeHailuo:
                         "feedMessage": {"message": "", "messageDetail": ""},
                         "feedTags": [],
                         "modelParameter": {"imageParameter": {
-                            "modelID": "nano_banana21_flash", "desc": "a cat",
+                            "modelID": str(meta.get("model") or "nano_banana21_flash"),
+                            "desc": str(meta.get("desc") or "a cat"),
                             "fileList": [], "aspectRatio": "Auto", "resolution": "4K"}},
                         "metaInfo": {"imageMetaInfo": {"mediaInfo": {
                             "url": self.feed_url.get(batch_id, ""),

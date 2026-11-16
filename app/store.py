@@ -477,6 +477,43 @@ class TaskStore:
                 .group_by(self.row_cls.credential_id)).all()
         return {(cred or ""): int(n) for cred, n in rows}
 
+    def orphans_without_batch(self, *, since: float, limit: int = 100) -> list[dict]:
+        """**疑似丢单**的任务：提交过、但没有 `upstream_batch_id`。
+
+        两种来源都算：
+        · `failure` —— 建任务请求发出去了但响应丢了（我们拿不到 batch id）；
+        · `queued`  —— 上一轮提交途中进程被杀，`attempts` 已经 >0。
+        这两种情况上游**可能已经建了任务并计费**，所以必须去对账，不能当没发生。
+        """
+        with self.session() as s:
+            rows = s.scalars(
+                select(self.row_cls).where(
+                    self.row_cls.status.in_((ST_FAILURE, ST_QUEUED)),
+                    or_(self.row_cls.upstream_batch_id == "",
+                        self.row_cls.upstream_batch_id.is_(None)),
+                    self.row_cls.submitted_at.is_not(None),
+                    self.row_cls.submitted_at >= since,
+                ).order_by(self.row_cls.created_at.asc()).limit(limit)).all()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                d = r.to_dict()
+                #: 🔴 对账要靠 `request.prompt` 精确匹配；`to_dict()` 刻意不带 request
+                #: （列表接口不该把请求体吐出去）⇒ 在这里补一份，仅内部使用。
+                d["request"] = json.loads(r.request_json or "{}")
+                out.append(d)
+            return out
+
+    def claimed_batch_ids(self, batch_ids: list[str]) -> set[str]:
+        """已被本地任务占用的批次号（对账时排除，避免一图认两个任务）。"""
+        ids = [b for b in batch_ids if b]
+        if not ids:
+            return set()
+        with self.session() as s:
+            rows = s.scalars(
+                select(self.row_cls.upstream_batch_id)
+                .where(self.row_cls.upstream_batch_id.in_(ids))).all()
+        return {r for r in rows if r}
+
     def count_queued(self) -> int:
         with self.session() as s:
             return int(s.scalar(

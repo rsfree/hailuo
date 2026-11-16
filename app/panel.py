@@ -195,6 +195,16 @@ def install_panel(app: FastAPI, *, settings: Any, service: Any,
             r["generations"] = generated.get(r["fp"], 0)
         return {"accounts": rows}
 
+    @app.post("/panel/api/reconcile", include_in_schema=False)
+    def reconcile_now(request: Request) -> dict[str, Any]:
+        """手动触发一次上游对账（运维用）。
+
+        自动对账由协调器按 `RECONCILE_INTERVAL` 跑；这个按钮用于"刚怀疑丢单、
+        不想等下一轮"。它只读上游 + 必要时回写本地，**不会新建任何上游任务**。
+        """
+        guard(request)
+        return {"stats": service.reconcile()}
+
     @app.post("/panel/api/accounts", include_in_schema=False)
     def create_account(body: AccountBody, request: Request) -> dict[str, Any]:
         guard(request)
