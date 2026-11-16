@@ -146,3 +146,12 @@ def test_counts_shape(accounts: AccountStore, cipher: AccountCipher) -> None:
     assert c["total"] == 2
     assert c["active"] == 2
     assert c["expired"] == 0
+
+
+def test_pick_skips_busy_accounts(accounts: AccountStore, cipher: AccountCipher) -> None:
+    """满载账号先排除；全忙时退回全体可用（宁排队不 503）。"""
+    a = accounts.add(token=FAKE_JWT, claims=claims(), cipher=cipher)
+    b = accounts.add(token=FAKE_JWT_B, claims=claims(subject="b"), cipher=cipher)
+    assert accounts.pick(busy_fps={a["fp"]})["id"] == b["id"]
+    both = accounts.pick(busy_fps={a["fp"], b["fp"]})
+    assert both["id"] in (a["id"], b["id"]), "全忙时必须退回，不能返回 None"

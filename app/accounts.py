@@ -314,7 +314,13 @@ class AccountStore:
                 return None
             return cipher.decrypt(row.token_enc)
 
-    def pick(self, *, now: float | None = None) -> dict[str, Any] | None:
+    def pick(self, *, now: float | None = None,
+             busy_fps: frozenset[str] | set[str] = frozenset()) -> dict[str, Any] | None:
+        """挑一个账号。
+
+        `busy_fps` = 已达并发上限的账号指纹集合 ⇒ **先排除**它们；若排除后为空，
+        再退回全体可用账号（宁可排队，也不因为"暂时都忙"把请求判 503）。
+        """
         now = time.time() if now is None else now
         with Session(self.engine) as s:
             rows = s.scalars(select(AccountRow).where(
@@ -322,6 +328,9 @@ class AccountStore:
             usable = [r for r in rows
                       if (r.exp is None or r.exp > now + EXP_SKEW)
                       and r.cooldown_until <= now]
+            idle = [r for r in usable if r.fp not in busy_fps]
+            if idle:
+                usable = idle
             if not usable:
                 return None
             usable.sort(key=lambda r: (-r.weight, r.last_used_at or 0.0,

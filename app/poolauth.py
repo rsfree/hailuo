@@ -77,12 +77,22 @@ class PoolAuth:
         #: 逐字常量时间比较：`in` 会短路，长度/前缀可被计时侧信道利用。
         return any(secrets.compare_digest(key, k) for k in self.service_keys)
 
+    def _busy_fingerprints(self) -> set[str]:
+        """已达**单账号并发上限**的指纹集合（按库里的在途任务计数）。
+
+        轮换的意义不只是"分摊额度"，还包括"别把请求压到一个正在跑的号上"：
+        `HL_CONCURRENCY=1` 时一个号同时只能跑一条，压上去只会白排队。
+        """
+        limit = max(1, int(getattr(self.settings, "hl_concurrency", 1)))
+        counts = self.service.store.active_counts_by_credential()
+        return {fp for fp, n in counts.items() if fp and n >= limit}
+
     def _issue_from_pool(self, key: str) -> Caller:
         if self.cipher is None:
             raise CredentialUnavailable(
                 "号池未配置加密主密钥（ACCOUNT_ENC_KEY），无法解密账号 token —— "
                 "请在环境变量里配置 32 字节密钥后重启。")
-        rec = self.accounts.pick()
+        rec = self.accounts.pick(busy_fps=self._busy_fingerprints())
         if rec is None:
             raise CredentialUnavailable(
                 "号池当前没有可用账号（全部为停用/过期/冷却中）。"

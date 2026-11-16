@@ -381,6 +381,42 @@ class Service:
             logger.warning(f"号池账号 {rec['id'][:8]} 限流/风控，"
                            f"冷却 {self.settings.hl_cooldown:.0f}s：{err}")
 
+    def _rotate_credential(self, task_id: str, current: str | None) -> str | None:
+        """建任务**前**失败 ⇒ 换一个号重试（只在池化模式）。
+
+        边界（刻意写死，别放宽）：
+
+        - 必须配置了 `SERVICE_KEYS`（池化）。透传模式下 credential 就是**调用方的
+          token**，换号等于花别人的钱 —— 绝不执行；
+        - 只由 `pre_create` 失败触发（上游一定没建任务）⇒ 不会重复计费；
+        - 只改 `credential_id`（用哪个号），`owner_id`（谁能看见）保持不变。
+
+        返回新指纹；没换则 `None`。
+        """
+        if not self.settings.service_keys or not current:
+            return None
+        accounts = getattr(self, "accounts", None)
+        cipher = getattr(self, "account_cipher", None)
+        if accounts is None or cipher is None:
+            return None
+        rec = accounts.pick(busy_fps={current})
+        if rec is None or rec["fp"] == current:
+            return None
+        token = accounts.token_of(rec["id"], cipher)
+        if not token:
+            return None
+        try:
+            claims = parse_jwt(token)
+        except AuthError:
+            accounts.record_failure(rec["id"], error="token 过期/非法", fatal=True)
+            return None
+        self.credentials.put(rec["fp"], token, claims)
+        accounts.record_use(rec["id"])
+        self.store.update_task(task_id, credential_id=rec["fp"])
+        logger.warning(f"建任务前失败 ⇒ 换号 {current[:12]}… → "
+                       f"{rec['fp'][:12]}…（未计费，可安全重试）")
+        return rec["fp"]
+
     def register_credential(self, token: str) -> str:
         """校验并登记一个**透传凭据**，返回凭证指纹。
 
@@ -996,6 +1032,9 @@ class Service:
             )
         except AdapterError as e:
             self.note_account_failure(full.get("credential_id"), e)
+            if getattr(e, "pre_create", False):
+                #: 没发出建任务请求 ⇒ 换号重试不产生任何计费风险
+                self._rotate_credential(task_id, full.get("credential_id"))
             raise
         OBS.upstream("create_image", task_id=task_id, **trace)
 

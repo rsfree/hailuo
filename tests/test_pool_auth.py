@@ -138,3 +138,62 @@ def test_upstream_401_marks_account_dead(pool, fake) -> None:
     acc = app.state.accounts.get(rec["id"])
     assert acc["status"] == "dead"
     assert app.state.accounts.pick() is None
+
+
+def test_pre_create_failure_rotates_to_other_account(pool, fake, monkeypatch) -> None:
+    """建任务**前**失败（未计费）⇒ 换一个号；下一次提交必须用新号的 token。"""
+    from app.errors import UpstreamError
+    from app.upstream.hailuo.client import HailuoClient
+
+    client, svc, app = pool
+    _add_account(app, FAKE_JWT)
+    _add_account(app, FAKE_JWT_B)
+
+    def boom(*_a, **_kw):
+        err = UpstreamError("connection reset before create")
+        err.pre_create = True
+        raise err
+
+    monkeypatch.setattr(HailuoClient, "create_image", boom)
+    r = client.post("/async/v1/images/generations", json=BODY,
+                    headers={"Authorization": f"Bearer {SERVICE_KEY}"})
+    task_id = r.json()["task_id"]
+    first = svc.store.get_full(task_id)["credential_id"]
+
+    with pytest.raises(UpstreamError):
+        svc.submit(task_id)
+
+    after = svc.store.get_full(task_id)["credential_id"]
+    assert after != first, "pre_create 失败必须换号"
+    assert svc.store.get_full(task_id)["owner_id"].startswith("svc-"), "归属不许被换掉"
+
+    monkeypatch.undo()
+    out = svc.submit(task_id)
+    assert out["submitted"] is True
+    expected = svc.credential_of(FAKE_JWT_B) if after != svc.credential_of(FAKE_JWT) \
+        else svc.credential_of(FAKE_JWT)
+    assert fake.tokens_seen[-1] == (FAKE_JWT_B if expected == svc.credential_of(FAKE_JWT_B)
+                                    else FAKE_JWT)
+
+
+def test_passthrough_never_rotates(settings, store, service, fake, monkeypatch) -> None:
+    """透传模式换号 = 花别人的钱，必须**不换**。"""
+    from app.errors import UpstreamError
+    from app.main import create_app
+    from app.upstream.hailuo.client import HailuoClient
+
+    client = TestClient(create_app(settings, service=service))
+    r = client.post("/async/v1/images/generations", json=BODY,
+                    headers={"Authorization": f"Bearer {FAKE_JWT}"})
+    task_id = r.json()["task_id"]
+    before = service.store.get_full(task_id)["credential_id"]
+
+    def boom(*_a, **_kw):
+        err = UpstreamError("reset")
+        err.pre_create = True
+        raise err
+
+    monkeypatch.setattr(HailuoClient, "create_image", boom)
+    with pytest.raises(UpstreamError):
+        service.submit(task_id)
+    assert service.store.get_full(task_id)["credential_id"] == before

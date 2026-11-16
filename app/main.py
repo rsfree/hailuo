@@ -222,6 +222,7 @@ def create_app(settings: Settings | None = None,
     accounts = AccountStore(service.store.engine, fingerprint=service.credential_of)
     #: 让 Service 能把上游失败**回灌号池**（只影响下次选号，见 note_account_failure）。
     service.accounts = accounts
+    service.account_cipher = cipher
     app.state.accounts = accounts
     app.state.cipher = cipher
     app.state.pool_auth = PoolAuth(settings=settings, service=service,
