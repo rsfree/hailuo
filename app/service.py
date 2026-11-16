@@ -325,12 +325,45 @@ class Service:
         if self._client is not None and self._uploader is not None:
             return self._client, self._uploader
         pair = self.credentials.clients_for(credential or "", self.settings)
+        if pair is None and credential and self._rehydrate(credential):
+            #: 池化模式的自愈：任务只带指纹，而账号表里有**加密**的 token ⇒
+            #: 重启/淘汰后能从库里恢复，不必让在途任务白白失败。
+            pair = self.credentials.clients_for(credential, self.settings)
         if pair is None:
             raise CredentialUnavailable(
-                "透传凭据已不在内存池（多为：服务重启，或 token 过期/被淘汰）。"
-                "明文凭据不落库，重启后无法恢复 —— 请用同一 token 重新提交任务；"
-                "若任务已建到上游，可用该账号在 hailuo 侧查看原批次。")
+                "凭据已不在内存池，且无法从号池恢复：透传 token 本就**不落库**"
+                "（重启即失）；池化账号则可能是被删除/过期/停用。"
+                "请用同一 token 重新提交任务；若任务已建到上游，"
+                "可用该账号在 hailuo 侧查看原批次。")
         return pair
+
+    def _rehydrate(self, fingerprint: str) -> bool:
+        """从号池把**加密保存**的 token 解回内存池（池化模式专用）。
+
+        🔴 这是池化模式必须补上的一环：任务落库时只带指纹，进程重启后内存池是空的。
+        如果照搬透传时代"明文不落库 ⇒ 重启即失"的处理，**每次发版升级都会打挂在途任务**
+        （2026-11-17 就因此失败了一条真实任务）。token 本来就在号池里加密存着，
+        没有理由不恢复。
+        """
+        accounts = getattr(self, "accounts", None)
+        cipher = getattr(self, "account_cipher", None)
+        if accounts is None or cipher is None:
+            return False
+        rec = accounts.get_by_fp(fingerprint)
+        if rec is None:
+            return False
+        try:
+            token = accounts.token_of(rec["id"], cipher)
+            if not token:
+                return False
+            claims = parse_jwt(token)
+        except (AuthError, ValueError) as e:
+            accounts.record_failure(rec["id"], error=str(e), fatal=True)
+            logger.warning(f"号池凭据 {fingerprint[:8]}… 无法恢复（{e}），已判失效")
+            return False
+        self.credentials.put(fingerprint, token, claims)
+        logger.info(f"凭据已从号池恢复：{fingerprint[:8]}…（账号 {rec['label'] or rec['id']}）")
+        return True
 
     def gate_for(self, credential_id: str | None) -> Gate:
         """取**该账号**的节奏闸门（惰性创建，每个凭据指纹一把）。

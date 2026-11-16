@@ -206,3 +206,45 @@ def test_readyz_and_stats_report_real_auth_mode(pool, fake) -> None:
     assert ready.status_code == 200
     assert ready.json()["auth"] == "jwt-passthrough+service-key"
     assert client.get("/stats").json()["auth"] == "jwt-passthrough+service-key"
+
+
+def test_credential_rehydrates_from_pool_after_restart(pool, fake) -> None:
+    """进程重启后，池化任务必须能从**加密账号表**恢复凭据，而不是直接判失败。
+
+    2026-11-17 生产事故：发版重启把内存池清空，在途任务被判 credential_unavailable。
+    """
+    client, svc, app = pool
+    _add_account(app)
+    r = client.post("/async/v1/images/generations", json=BODY,
+                    headers={"Authorization": f"Bearer {SERVICE_KEY}"})
+    task_id = r.json()["task_id"]
+    cred = svc.store.get_full(task_id)["credential_id"]
+
+    #: 模拟重启：内存池清空
+    assert svc.credentials.forget(cred) is True
+    assert svc.credentials.get(cred) is None
+
+    out = svc.submit(task_id)          # 不抛 CredentialUnavailable
+    assert out["submitted"] is True
+    assert fake.tokens_seen[-1] == FAKE_JWT
+    assert svc.credentials.get(cred) is not None, "恢复后应重新入池"
+
+
+def test_passthrough_credential_is_not_rehydrated(settings, store, fake) -> None:
+    """透传 token 不落库 ⇒ 重启后仍应明确失败，不能凭空变出凭据。
+
+    ⚠️ 必须用 **HTTP 模式**的 Service：`service` 夹具注入了 client（嵌入模式），
+    那条路根本不查凭据池，测不到这里的行为。
+    """
+    from app.errors import CredentialUnavailable
+    from app.main import create_app
+
+    svc = _http_service(settings, store, fake)
+    client = TestClient(create_app(settings, service=svc))
+    r = client.post("/async/v1/images/generations", json=BODY,
+                    headers={"Authorization": f"Bearer {FAKE_JWT}"})
+    task_id = r.json()["task_id"]
+    cred = svc.store.get_full(task_id)["credential_id"]
+    svc.credentials.forget(cred)
+    with pytest.raises(CredentialUnavailable):
+        svc.submit(task_id)
