@@ -459,7 +459,7 @@ def _install_routes(app: FastAPI) -> None:
             return JSONResponse(status_code=503, content={
                 "status": "not_ready", "reason": "任务库不可连", "dsn": svc.store.dsn})
         return JSONResponse(status_code=200, content={
-            "status": "ready", "auth": "jwt-passthrough"})
+            "status": "ready", "auth": svc.settings.auth_mode})
 
     @app.get("/stats")
     async def stats(request: Request) -> dict:

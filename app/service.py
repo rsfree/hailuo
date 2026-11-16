@@ -1429,7 +1429,7 @@ class Service:
         return {
             "service": self.settings.otel_service_name,
             "upstream_configured": self.settings.upstream_configured,
-            "auth": "jwt-passthrough",
+            "auth": self.settings.auth_mode,
             "credentials": self.credentials.stats(),
             "concurrency_limit": self.settings.hl_concurrency,
             "gate": self.gate.stats(),

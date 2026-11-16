@@ -299,6 +299,16 @@ class Settings:
         return bool((self.hailuo_token or "").strip())
 
     @property
+    def auth_mode(self) -> str:
+        """入口鉴权**实际形态**（观测面用）。
+
+        两条路是**叠加**关系，不是二选一：三段式 JWT 永远走透传，命中
+        `HAILUO_API_KEYS` 时才额外启用池化出号。所以池化模式下标签是
+        `jwt-passthrough+service-key` —— 把它写成 `pool` 会掩盖"透传仍开放"这个事实。
+        """
+        return "jwt-passthrough+service-key" if self.service_keys else "jwt-passthrough"
+
+    @property
     def tls_enabled(self) -> bool:
         """证书与私钥都配了才算启用（缺一个 `validate()` 会直接拒启动）。"""
         return bool(self.tls_certfile and self.tls_keyfile)

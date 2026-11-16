@@ -197,3 +197,12 @@ def test_passthrough_never_rotates(settings, store, service, fake, monkeypatch) 
     with pytest.raises(UpstreamError):
         service.submit(task_id)
     assert service.store.get_full(task_id)["credential_id"] == before
+
+
+def test_readyz_and_stats_report_real_auth_mode(pool, fake) -> None:
+    """池化开启后，观测面必须如实说明"两条路都在"，而不是硬写透传。"""
+    client, _svc, _app = pool
+    ready = client.get("/readyz")
+    assert ready.status_code == 200
+    assert ready.json()["auth"] == "jwt-passthrough+service-key"
+    assert client.get("/stats").json()["auth"] == "jwt-passthrough+service-key"
