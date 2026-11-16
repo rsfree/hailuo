@@ -38,6 +38,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor  # noqa: F401 —— 与 matrix 同构留用
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 from PIL import Image
 
@@ -261,11 +262,32 @@ def _suffix(raw: bytes) -> str:
     return ".webp"
 
 
+def _get_retry(url: str, *, attempts: int = 4) -> Any:
+    """带退避的 GET。**CDN 偶发掐新建连接**（实测 t2i-1k 首次 ConnectTimeout），
+    下载是幂等的 ⇒ 重试零副作用；5xx/429 也重试，4xx 直接放弃（重试无意义）。
+    """
+    import httpx  # noqa: PLC0415
+
+    last = ""
+    for i in range(1, attempts + 1):
+        try:
+            r = httpx.get(url, timeout=30, follow_redirects=True)
+            if r.status_code in (429,) or r.status_code >= 500:
+                last = f"HTTP {r.status_code}"
+            else:
+                return r
+        except httpx.TransportError as e:
+            last = f"{type(e).__name__}: {e}"
+        if i < attempts:
+            time.sleep(0.4 * i)
+    raise RuntimeError(f"下载失败（已重试 {attempts} 次）：{url}（{last}）")
+
+
 def download(name: str, idx: int, url: str) -> str:
     import httpx  # noqa: PLC0415
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    r = httpx.get(url, timeout=30, follow_redirects=True)
+    r = _get_retry(url)
     raw = r.content
     if r.status_code != 200 or not _looks_like_image(raw):
         raise RuntimeError(

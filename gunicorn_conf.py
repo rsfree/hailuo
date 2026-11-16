@@ -37,6 +37,13 @@ timeout = int(os.environ.get("GUNICORN_TIMEOUT", "120"))
 graceful_timeout = 30
 keepalive = 5
 
+#: TLS：两个都配了才启用（与 `Settings.validate()` 的"成对"判据同源）。
+_cert = os.environ.get("TLS_CERTFILE", "").strip()
+_key = os.environ.get("TLS_KEYFILE", "").strip()
+if _cert and _key:
+    certfile = _cert
+    keyfile = _key
+
 #: 受理请求很轻（只落库），日志交给 loguru（应用内） ⇒ 不重复出 access log。
 accesslog = None
 errorlog = "-"

@@ -486,14 +486,19 @@ class Service:
 
     # ------------------------------------------------------------------ 受理
 
-    def create(self, body: dict[str, Any], *, credential: str) -> dict[str, Any]:
-        """受理一次生成。**只落库，零上游往返。**"""
+    def create(self, body: dict[str, Any], *, credential: str,
+               owner: str | None = None) -> dict[str, Any]:
+        """受理一次生成。**只落库，零上游往返。**
+
+        `owner` 是**任务归属**（可见性）；不传则等于 `credential`（透传模式的旧行为）。
+        """
         request = dict(body or {})
         plan, capability, upstream_model = self.build_plan(request)
 
         rec = self.store.create_task(
             task_id=new_task_id(),
             credential_id=credential,
+            owner_id=owner or credential,
             capability=capability,
             model=str(request.get("model") or ""),
             upstream_model=upstream_model,
@@ -1301,7 +1306,7 @@ class Service:
     # ------------------------------------------------------------------ 查询
 
     def get_for_credential(self, task_id: str,
-                           credential: str | None) -> dict[str, Any]:
+                           owner: str | None) -> dict[str, Any]:
         """按 id 取任务。**带 Key 时必须属于该 Key**；不带 Key 放行（id 即凭据）。
 
         ⚠️ 刻意**不区分**"不存在"与"不属于你" —— 区分开等于确认 id 存在。
@@ -1309,8 +1314,11 @@ class Service:
         full = self.store.get_full(task_id)
         if not full:
             raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
-        if credential is not None and full.get("credential_id") != credential:
-            raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
+        if owner is not None:
+            #: 历史行没有 owner_id ⇒ 按 credential_id 兜底（升级不丢任务）
+            task_owner = full.get("owner_id") or full.get("credential_id")
+            if task_owner != owner:
+                raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
         return full
 
     def wait_terminal(self, task_id: str, credential: str, *,
@@ -1342,18 +1350,18 @@ class Service:
                 return full
             time.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
 
-    def list_for_credential(self, credential: str, *, limit: int = 50) -> dict[str, Any]:
-        """**只列自己的** —— 只按服务过滤会把别人的任务列给你。"""
-        rows = self.store.list_for_credential(credential, limit=limit)
+    def list_for_credential(self, owner: str, *, limit: int = 50) -> dict[str, Any]:
+        """**只列自己的** —— 按 owner 过滤，池化模式下不同服务 Key 互不可见。"""
+        rows = self.store.list_for_owner(owner, limit=limit)
         return {"object": "list", "data": [
             {"task_id": r["task_id"], "status": r["status"], "model": r["model"],
              "capability": r["capability"], "created_at": r["created_at"]}
             for r in rows
         ]}
 
-    def delete_for_credential(self, task_id: str, credential: str) -> dict[str, Any]:
-        """删除**已终态**的任务。未终态**响亮失败**。"""
-        full = self.get_for_credential(task_id, credential)
+    def delete_for_credential(self, task_id: str, owner: str) -> dict[str, Any]:
+        """删除**已终态**的任务。未终态**响亮失败**。归属判定在删除之前。"""
+        full = self.get_for_credential(task_id, owner)
         if full["status"] not in TERMINAL:
             raise TaskNotDeletable(
                 f"任务 {task_id} 状态是 {full['status']!r}，未到终态 ⇒ 不能删。"

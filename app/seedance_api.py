@@ -32,6 +32,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .poolauth import Caller, PoolAuth
 from .errors import AuthError
 from .video_service import VideoService, video_view
 
@@ -55,18 +56,18 @@ def _bearer(request: Request) -> str | None:
     return raw.strip() or None
 
 
-def require_video_key(request: Request) -> str:
-    """**写**接口与（默认）列表接口的鉴权：hailuo JWT 透传。"""
-    service: VideoService = request.app.state.video_service
+def require_video_key(request: Request) -> Caller:
+    """**写**接口与（默认）列表接口的鉴权：JWT 透传 或 服务 Key 从池取号。"""
     key = _bearer(request)
     if not key:
         raise AuthError(
             "缺少 Authorization: Bearer <token> —— 请传你的 hailuo 登录 token"
             "（浏览器 F12 里任意请求的 `token` 头 / JWT 形态的那串）。")
-    return service.register_credential(key)
+    pool_auth: PoolAuth = request.app.state.pool_auth
+    return pool_auth.resolve(key)
 
 
-def optional_video_key(request: Request) -> str | None:
+def optional_video_key(request: Request) -> Caller | None:
     """**可选**凭据：带了就校验（错了照旧 401），没带返回 `None`。"""
     if _bearer(request) is None:
         return None
@@ -85,7 +86,7 @@ def install_video_routes(app: FastAPI) -> None:
     async def create_video_task(
         request: Request,
         body: dict[str, Any],
-        credential: str = Depends(require_video_key),
+        caller: Caller = Depends(require_video_key),
     ) -> JSONResponse:
         """受理一次视频生成，**只回一个 id**。
 
@@ -94,7 +95,8 @@ def install_video_routes(app: FastAPI) -> None:
         而不是让受理请求跟着一起抖。
         """
         svc: VideoService = request.app.state.video_service
-        rec = svc.create_video(body, credential=credential)
+        rec = svc.create_video(body, credential=caller.credential_id,
+                               owner=caller.owner_id)
         request.app.state.video_coordinator.wake()
         return JSONResponse(
             status_code=200, content={"id": rec["task_id"]},
@@ -113,17 +115,17 @@ def install_video_routes(app: FastAPI) -> None:
         request: Request,
         page_num: int = 1,
         page_size: int = DEFAULT_PAGE_SIZE,
-        credential: str | None = Depends(optional_video_key),
+        caller: Caller | None = Depends(optional_video_key),
     ) -> dict[str, Any]:
         """任务列表。**默认要凭据**；不带凭据且 `VIDEO_LIST_REQUIRE_AUTH=0` ⇒ 列全部。"""
         svc: VideoService = request.app.state.video_service
-        if credential is None and svc.settings.video_list_require_auth:
+        if caller is None and svc.settings.video_list_require_auth:
             raise AuthError(
                 "列表端点需要 Authorization: Bearer <hailuo token>。"
                 "（它会列出任务 id，而 id 就是读接口的凭据 ⇒ 无凭据开放等于派发凭据；"
                 "确要开放请设 VIDEO_LIST_REQUIRE_AUTH=0。）")
         limit = max(1, min(page_size, MAX_PAGE_SIZE))
-        rows = svc.store.list_for_credential(credential or "", limit=limit)
+        rows = svc.store.list_for_owner(caller.owner_id if caller else "", limit=limit)
         #: 列表里的每一项**与查询同形**（原生语义），只是不带产物细节。
         items = []
         for r in rows:
@@ -141,7 +143,7 @@ def install_video_routes(app: FastAPI) -> None:
     async def delete_video_task(
         request: Request,
         task_id: str,
-        credential: str = Depends(require_video_key),
+        caller: Caller = Depends(require_video_key),
     ) -> dict[str, Any]:
         """删除**已终态**的任务。未终态**响亮失败（400）**。
 
@@ -149,7 +151,7 @@ def install_video_routes(app: FastAPI) -> None:
         本地删掉只会让"它还在跑并可能计费"变成看不见的事。
         """
         svc: VideoService = request.app.state.video_service
-        return svc.delete_for_credential(task_id, credential)
+        return svc.delete_for_credential(task_id, caller.owner_id)
 
     @app.get("/v1/models")
     async def list_models_openai(request: Request) -> dict[str, Any]:

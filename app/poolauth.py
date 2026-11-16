@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import secrets
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
@@ -33,6 +34,19 @@ from loguru import logger
 from .accounts import AccountCipher, AccountStore
 from .credentials import parse_jwt
 from .errors import AuthError, CredentialUnavailable
+
+
+@dataclass(frozen=True)
+class Caller:
+    """入口调用方的双身份。
+
+    · `credential_id` —— **用哪个号跑**（决定上游客户端与闸门，可能来自号池）；
+    · `owner_id` —— **谁能看见**（任务归属）。池化模式下多个服务 Key 共用同一账号，
+      但彼此看不到对方的任务；透传模式下两者同值，行为与旧版逐字一致。
+    """
+
+    credential_id: str
+    owner_id: str
 
 
 class PoolAuth:
@@ -49,20 +63,21 @@ class PoolAuth:
     def service_keys(self) -> tuple[str, ...]:
         return tuple(self.settings.service_keys or ())
 
-    def resolve(self, key: str) -> str:
+    def resolve(self, key: str) -> Caller:
         if key.count(".") == 2:
-            return self.service.register_credential(key)
+            cred = self.service.register_credential(key)
+            return Caller(credential_id=cred, owner_id=cred)
         if not self._is_service_key(key):
             raise AuthError(
                 "Authorization 既不是 hailuo JWT（三段式），也不是本服务配置的服务 Key。"
                 "透传请传你的 hailuo 登录 token；号池请用 SERVICE_KEYS 里的 Key。")
-        return self._issue_from_pool()
+        return self._issue_from_pool(key)
 
     def _is_service_key(self, key: str) -> bool:
         #: 逐字常量时间比较：`in` 会短路，长度/前缀可被计时侧信道利用。
         return any(secrets.compare_digest(key, k) for k in self.service_keys)
 
-    def _issue_from_pool(self) -> str:
+    def _issue_from_pool(self, key: str) -> Caller:
         if self.cipher is None:
             raise CredentialUnavailable(
                 "号池未配置加密主密钥（ACCOUNT_ENC_KEY），无法解密账号 token —— "
@@ -88,7 +103,9 @@ class PoolAuth:
         #: 登记进内存池：后续 `clients_for()` 按同一个指纹取客户端。
         self.service.credentials.put(rec["fp"], token, claims)
         self.accounts.record_use(rec["id"])
-        return rec["fp"]
+        #: 归属 = **该服务 Key** 的指纹（不是账号指纹）：隔离的落点在这里。
+        return Caller(credential_id=rec["fp"],
+                      owner_id="svc-" + self.service.credential_of(key))
 
 
-__all__ = ["PoolAuth"]
+__all__ = ["Caller", "PoolAuth"]

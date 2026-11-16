@@ -300,13 +300,15 @@ class VideoService(Service):
 
     # ------------------------------------------------------------------ 受理
 
-    def create_video(self, body: dict[str, Any], *, credential: str) -> dict[str, Any]:
+    def create_video(self, body: dict[str, Any], *, credential: str,
+                     owner: str | None = None) -> dict[str, Any]:
         """受理一次视频生成。**只落库，零上游往返。**"""
         request = dict(body or {})
         plan, capability, upstream_model = self.build_video_plan(request)
         rec = self.store.create_task(
             task_id=new_video_task_id(),
             credential_id=credential,
+            owner_id=owner or credential,
             capability=capability,
             model=str(request.get("model") or ""),
             upstream_model=upstream_model,

@@ -219,6 +219,10 @@ class Settings:
     account_enc_key: str = ""
     #: 池化出号的服务端 Key（逗号分隔）。空 ⇒ 只支持透传（与旧行为完全一致）。
     service_keys: tuple[str, ...] = ()
+    #: 服务自身 TLS 证书/私钥路径。**必须成对**：缺一个就启动失败，
+    #: 不做"看着像开了其实没开"的半吊子配置。不配则由网关终结 TLS。
+    tls_certfile: str = ""
+    tls_keyfile: str = ""
 
     startup_warnings: list[str] = field(default_factory=list)
 
@@ -233,6 +237,11 @@ class Settings:
         而它会让 `/readyz` 报 ready 却在建任务时 401。
         """
         return bool((self.hailuo_token or "").strip())
+
+    @property
+    def tls_enabled(self) -> bool:
+        """证书与私钥都配了才算启用（缺一个 `validate()` 会直接拒启动）。"""
+        return bool(self.tls_certfile and self.tls_keyfile)
 
     @property
     def db_target(self) -> str:
@@ -337,6 +346,8 @@ class Settings:
             admin_token=_s("ADMIN_TOKEN"),
             account_enc_key=_s("ACCOUNT_ENC_KEY"),
             service_keys=_csv("SERVICE_KEYS"),
+            tls_certfile=_s("TLS_CERTFILE"),
+            tls_keyfile=_s("TLS_KEYFILE"),
         )
         st.validate()
         return st
@@ -370,6 +381,10 @@ class Settings:
             raise ConfigError("VIDEO_TASK_TIMEOUT 必须 > 0")
         if self.video_poll_interval <= 0:
             raise ConfigError("VIDEO_POLL_INTERVAL 必须 > 0")
+        if bool(self.tls_certfile) != bool(self.tls_keyfile):
+            raise ConfigError(
+                "TLS_CERTFILE 与 TLS_KEYFILE 必须成对配置（当前只给了一个）—— "
+                "半个 TLS 会让服务在握手阶段才炸，不如启动就拒绝。")
         if self.hailuo_max_side_guard():
             raise ConfigError(
                 "HAILUO_SCREEN_WIDTH/HEIGHT 必须为正整数（它们参与签名）")
@@ -391,6 +406,11 @@ class Settings:
             self.startup_warnings.append(
                 "SERVICE_KEYS 已配置，但 ACCOUNT_ENC_KEY 为空 ⇒ 号池无法解密账号，"
                 "池化请求会以 503 credential_unavailable 失败（不会回落透传）。")
+        if self.admin_token and not self.tls_enabled:
+            self.startup_warnings.append(
+                "ADMIN_TOKEN 已配置但服务未启用 TLS（TLS_CERTFILE/TLS_KEYFILE 为空）："
+                "面板口令与 Cookie 会明文过网。请让网关终结 HTTPS 并转发 "
+                "X-Forwarded-Proto=https，或直接给本服务配证书。")
         if self.admin_token and not self.account_enc_key:
             self.startup_warnings.append(
                 "ADMIN_TOKEN 已配置，但 ACCOUNT_ENC_KEY 为空 ⇒ 面板能登录，"

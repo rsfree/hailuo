@@ -45,7 +45,7 @@ from .errors import (
 )
 from .observability import OBS, excluded_urls, is_probe_path, setup_logging, should_log_path
 from .panel import install_panel
-from .poolauth import PoolAuth
+from .poolauth import Caller, PoolAuth
 from .seedance_api import install_video_routes
 from .service import Service, view
 from .video_service import VideoService
@@ -108,7 +108,7 @@ def _bearer(request: Request) -> str | None:
     return raw.strip() or None
 
 
-def require_key(request: Request) -> str:
+def require_key(request: Request) -> Caller:
     """把入口 Bearer 解析成**凭证指纹**（不是明文）。两条路见 `app/poolauth.py`：
 
     - **透传**（三段式 JWT）⇒ 该 token 同时就是上游凭证，费用记在调用方账上；
@@ -126,7 +126,7 @@ def require_key(request: Request) -> str:
     return pool_auth.resolve(key)
 
 
-def require_key_optional(request: Request) -> str | None:
+def require_key_optional(request: Request) -> Caller | None:
     """**可选**的调用方 Key —— 只给"按 id 即凭据"的读接口用（GET 单条任务）。
 
     · **完全没带** ⇒ 返回 `None`，**放行**（`task_id` 是 128 位随机值，
@@ -311,7 +311,7 @@ def _install_routes(app: FastAPI) -> None:
     async def create_generation(
         request: Request,
         body: GenerationRequest,
-        credential: str = Depends(require_key),
+        caller: Caller = Depends(require_key),
     ) -> JSONResponse:
         """受理一次生成，**只回一个 task_id**。
 
@@ -320,7 +320,8 @@ def _install_routes(app: FastAPI) -> None:
         而不是让受理请求随上游网络抖动。
         """
         svc: Service = request.app.state.service
-        rec = svc.create(body.model_dump(), credential=credential)
+        rec = svc.create(body.model_dump(), credential=caller.credential_id,
+                         owner=caller.owner_id)
         # 叫醒协调器：不然这条任务要等到下一个 tick 才被发现（默认最多白等 1s）。
         request.app.state.coordinator.wake()
         return JSONResponse(
@@ -332,7 +333,7 @@ def _install_routes(app: FastAPI) -> None:
     def create_generation_sync(
         request: Request,
         body: GenerationRequest,
-        credential: str = Depends(require_key),
+        caller: Caller = Depends(require_key),
     ) -> JSONResponse:
         """**同步**出图：创建 + 轮询合并进一个请求，预算内直接给最终结果。
 
@@ -369,9 +370,10 @@ def _install_routes(app: FastAPI) -> None:
                 retry_after=1.0)
         try:
             svc: Service = request.app.state.service
-            rec = svc.create(body.model_dump(), credential=credential)
+            rec = svc.create(body.model_dump(), credential=caller.credential_id,
+                             owner=caller.owner_id)
             coordinator.wake()
-            rec = svc.wait_terminal(rec["task_id"], credential,
+            rec = svc.wait_terminal(rec["task_id"], caller.owner_id,
                                     max_wait=settings.sync_max_wait)
         finally:
             slots.release()
@@ -387,7 +389,7 @@ def _install_routes(app: FastAPI) -> None:
     async def get_generation(
         request: Request,
         task_id: str,
-        credential: str | None = Depends(require_key_optional),
+        caller: Caller | None = Depends(require_key_optional),
     ) -> JSONResponse:
         """查任务。**不需要 Authorization：`task_id` 本身就是凭据。**
 
@@ -397,7 +399,7 @@ def _install_routes(app: FastAPI) -> None:
         · 不存在 / 不属于本 Key → **404**（**本地拦，不发上游请求**）。
         """
         svc: Service = request.app.state.service
-        rec = svc.get_for_credential(task_id, credential)
+        rec = svc.get_for_credential(task_id, caller.owner_id if caller else None)
         status_code, payload = view(rec)
         return JSONResponse(status_code=status_code, content=payload)
 
@@ -406,21 +408,21 @@ def _install_routes(app: FastAPI) -> None:
     async def list_generations(
         request: Request,
         limit: int = 50,
-        credential: str = Depends(require_key),
+        caller: Caller = Depends(require_key),
     ) -> dict:
         """本 Key 名下的任务列表。**只列自己的。**"""
         return request.app.state.service.list_for_credential(
-            credential, limit=max(1, min(limit, 200)))
+            caller.owner_id, limit=max(1, min(limit, 200)))
 
     @app.delete("/async/v1/images/generations/{task_id}")
     async def delete_generation(
         request: Request,
         task_id: str,
-        credential: str = Depends(require_key),
+        caller: Caller = Depends(require_key),
     ) -> dict:
         """删除任务。**未终态的任务响亮失败（400）** —— hailuo 没有取消端点，
         本地删掉只会让"还在跑并可能计费"变成看不见的事。"""
-        return request.app.state.service.delete_for_credential(task_id, credential)
+        return request.app.state.service.delete_for_credential(task_id, caller.owner_id)
 
     # ------------------------------------------------------------- 能力
     @app.get("/async/v1/models")
@@ -482,4 +484,6 @@ if __name__ == "__main__":  # pragma: no cover
     settings = Settings.from_env()
     uvicorn.run("app.main:create_app", factory=True,
                 host=settings.host, port=settings.port,
-                log_level=settings.log_level.lower())
+                log_level=settings.log_level.lower(),
+                ssl_certfile=settings.tls_certfile or None,
+                ssl_keyfile=settings.tls_keyfile or None)

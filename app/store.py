@@ -53,10 +53,14 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
     create_engine,
     delete,
     func,
+    inspect,
+    or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -87,6 +91,10 @@ class _TaskColumns(Base):
 
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     credential_id: Mapped[str] = mapped_column(String(64), index=True)
+    #: 任务归属的**调用方**（谁能看见），与 `credential_id`（用哪个号跑）分开：
+    #: 池化模式下多个服务 Key 共用同一账号，但彼此**不许**看到对方任务。
+    #: 透传模式下两者同值 ⇒ 行为与旧版逐字一致。
+    owner_id: Mapped[str] = mapped_column(String(64), index=True, default="")
     #: 对外能力名（图片：hailuo-i2i / hailuo-t2i…；视频：hailuo-video / hailuo-2.3 …）
     capability: Mapped[str] = mapped_column(String(32))
     #: 调用方请求的原始 model 字符串
@@ -120,6 +128,7 @@ class _TaskColumns(Base):
             "task_id": self.task_id,
             #: 🔴 归属校验靠它 —— 漏了它会让**每一个**带 Key 的查询都 404
             "credential_id": self.credential_id,
+            "owner_id": self.owner_id,
             "capability": self.capability,
             "model": self.model,
             "upstream_model": self.upstream_model,
@@ -215,6 +224,7 @@ class TaskStore:
         self.engine = create_engine(dsn, **kwargs)
         self._session = sessionmaker(bind=self.engine, expire_on_commit=False)
         Base.metadata.create_all(self.engine)
+        self._ensure_owner_column()
 
     # ------------------------------------------------------------------ 会话
 
@@ -229,6 +239,25 @@ class TaskStore:
             raise
         finally:
             s.close()
+
+    def _ensure_owner_column(self) -> None:
+        """老库补 `owner_id` 列并回填。
+
+        `create_all` 只建表、**不改列** ⇒ 已在跑的部署单靠它拿不到新列，
+        随后每条 `SELECT ... owner_id` 都会炸。这里做一次幂等迁移：
+        补列 + 用 `credential_id` 回填（历史任务本来就只属于原凭据）。
+        """
+        table = self.row_cls.__tablename__
+        cols = {c["name"] for c in inspect(self.engine).get_columns(table)}
+        if "owner_id" in cols:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE {table} ADD COLUMN owner_id VARCHAR(64) DEFAULT ''"))
+            conn.execute(text(
+                f"UPDATE {table} SET owner_id = credential_id "
+                "WHERE owner_id IS NULL OR owner_id = ''"))
+        logger.info(f"{table} 已补 owner_id 列并回填（历史任务归原凭据）")
 
     def ping(self) -> bool:
         try:
@@ -337,10 +366,18 @@ class TaskStore:
             })
             return out
 
-    def list_for_credential(self, credential_id: str, *, limit: int = 50) -> list[dict]:
+    def list_for_owner(self, owner_id: str, *, limit: int = 50) -> list[dict]:
+        """只列**该调用方**的任务。
+
+        `owner_id=""` 的历史行按 `credential_id` 兜底 —— 否则升级那一刻，
+        所有老任务对调用方都会"消失"（比不隔离更糟）。
+        """
+        owner = or_(self.row_cls.owner_id == owner_id,
+                    and_(self.row_cls.owner_id == "",
+                         self.row_cls.credential_id == owner_id))
         with self.session() as s:
             rows = s.scalars(
-                select(self.row_cls).where(self.row_cls.credential_id == credential_id)
+                select(self.row_cls).where(owner)
                 .order_by(self.row_cls.created_at.desc()).limit(limit)
             ).all()
             return [r.to_dict() for r in rows]

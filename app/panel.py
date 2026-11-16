@@ -74,6 +74,15 @@ def _sign(secret: str, exp: int) -> str:
                     hashlib.sha256).hexdigest()[:32]
 
 
+def _is_https(request: Request) -> bool:
+    """是否走的 HTTPS：直连看 scheme，网关终结看 `X-Forwarded-Proto`。
+
+    只认这一处：Cookie 的 `Secure` 属性由它决定，散落各处必然漏。
+    """
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0]
+    return request.url.scheme == "https" or proto.strip().lower() == "https"
+
+
 def _issue(secret: str) -> tuple[str, int]:
     exp = int(time.time()) + SESSION_TTL
     return f"{exp}.{_sign(secret, exp)}", SESSION_TTL
@@ -135,13 +144,13 @@ def install_panel(app: FastAPI, *, settings: Any, service: Any,
     # ------------------------------------------------------------------ 会话
 
     @app.post("/panel/api/login", include_in_schema=False)
-    def login(body: LoginBody, response: Response) -> dict[str, Any]:
+    def login(body: LoginBody, request: Request, response: Response) -> dict[str, Any]:
         if not hmac.compare_digest(body.token or "", secret):
             raise HTTPException(status_code=401, detail={
                 "error": {"message": "口令不正确", "code": "panel_bad_password"}})
         value, ttl = _issue(secret)
         response.set_cookie(COOKIE, value, max_age=ttl, httponly=True,
-                            samesite="lax")
+                            samesite="lax", secure=_is_https(request))
         return {"ok": True, "expires_in": ttl}
 
     @app.post("/panel/api/logout", include_in_schema=False)
