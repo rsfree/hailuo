@@ -197,6 +197,17 @@ class CapabilityUnavailable(AdapterError):
     error_type = "service_unavailable"
 
 
+class QuotaExceeded(AdapterError):
+    """服务 Key 的每日配额用尽。**429**：不是服务不可用，是"今天到此为止"。
+
+    刻意与限流区分：限流是"太快，退避再来"；配额是"当天额度没了，明天再来"。
+    """
+
+    status_code = 429
+    code = "quota_exceeded"
+    error_type = "rate_limit_error"
+
+
 class TaskNotDeletable(AdapterError):
     """未终态的任务不能删 —— 上游**没有取消端点**，本地置删不会让上游停下来。"""
 

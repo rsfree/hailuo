@@ -301,10 +301,12 @@ class VideoService(Service):
     # ------------------------------------------------------------------ 受理
 
     def create_video(self, body: dict[str, Any], *, credential: str,
-                     owner: str | None = None) -> dict[str, Any]:
+                     owner: str | None = None, quota: int = 0,
+                     label: str = "") -> dict[str, Any]:
         """受理一次视频生成。**只落库，零上游往返。**"""
         request = dict(body or {})
         plan, capability, upstream_model = self.build_video_plan(request)
+        self._consume_quota(owner or credential, quota, label=label)
         rec = self.store.create_task(
             task_id=new_video_task_id(),
             credential_id=credential,

@@ -96,7 +96,8 @@ def install_video_routes(app: FastAPI) -> None:
         """
         svc: VideoService = request.app.state.video_service
         rec = svc.create_video(body, credential=caller.credential_id,
-                               owner=caller.owner_id)
+                               owner=caller.owner_id, quota=caller.quota,
+                               label=caller.label)
         request.app.state.video_coordinator.wake()
         return JSONResponse(
             status_code=200, content={"id": rec["task_id"]},

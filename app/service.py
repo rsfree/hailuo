@@ -59,6 +59,7 @@ from .errors import (
     TaskNotDeletable,
     TaskNotFoundError,
     CredentialUnavailable,
+    QuotaExceeded,
     UpstreamQuotaExhausted,
     UpstreamRateLimited,
 )
@@ -427,6 +428,16 @@ class Service:
         self.credentials.put(fingerprint, token, claims)
         return fingerprint
 
+    def _consume_quota(self, owner: str, quota: int, *, label: str = "") -> None:
+        """配额预扣。`quota<=0` ⇒ 不限（仍记用量，便于面板看趋势）。"""
+        if quota <= 0:
+            return
+        day = time.strftime("%Y-%m-%d")
+        if not self.store.consume_quota(owner, day, limit=quota):
+            raise QuotaExceeded(
+                f"服务 Key「{label or owner}」的每日配额已用尽（{quota} 次/日）。"
+                "请明天再试，或联系管理员调整配额。")
+
     def _fail_task(self, task_id: str, err: AdapterError) -> None:
         """把任务判失败并带上**可读原因**（唯一判失败入口，避免各处自造形状）。"""
         self.store.update_task(
@@ -523,13 +534,16 @@ class Service:
     # ------------------------------------------------------------------ 受理
 
     def create(self, body: dict[str, Any], *, credential: str,
-               owner: str | None = None) -> dict[str, Any]:
+               owner: str | None = None, quota: int = 0,
+               label: str = "") -> dict[str, Any]:
         """受理一次生成。**只落库，零上游往返。**
 
         `owner` 是**任务归属**（可见性）；不传则等于 `credential`（透传模式的旧行为）。
         """
         request = dict(body or {})
         plan, capability, upstream_model = self.build_plan(request)
+        #: 配额在**校验通过之后**才扣：写错参数的请求不该吃掉额度。
+        self._consume_quota(owner or credential, quota, label=label)
 
         rec = self.store.create_task(
             task_id=new_task_id(),

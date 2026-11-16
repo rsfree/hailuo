@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import dataclasses
 import os
 from dataclasses import dataclass, field
@@ -57,6 +59,54 @@ def _b(key: str, default: bool) -> bool:
     if not raw:
         return default
     return raw.lower() in _TRUE
+
+
+_LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+
+
+def parse_service_keys(raw: tuple[str, ...] | list[str]) -> dict[str, tuple[str, int]]:
+    """`SERVICE_KEYS` → `{key: (label, quota_per_day)}`。
+
+    写法：`label:key:quota`（quota=0 或省略 ⇒ 不限）。**纯 key 仍然可用**，
+    老配置不会被这次改动弄坏。
+
+    键里**不允许出现冒号**：这是格式约束，不是安全策略 —— 出现冒号就没法
+    无歧义地解析，宁可启动就说明白。
+    """
+    out: dict[str, tuple[str, int]] = {}
+    for item in raw or ():
+        text = (item or "").strip()
+        if not text:
+            continue
+        parts = text.split(":")
+        #: 段数决定语义（必须无歧义）：1 段=纯 key；2 段=标签:Key（不限）；3 段=标签:Key:配额。
+        #: 因此 **Key 与标签里都不许出现冒号** —— 出现就没法解析，宁可在启动时说清楚。
+        if len(parts) == 1:
+            out[parts[0]] = ("", 0)
+            continue
+        if len(parts) not in (2, 3):
+            raise ValueError(
+                f"SERVICE_KEYS 条目段数不对（应为 key / label:key / label:key:quota）："
+                f"{text[:24]}…")
+        label = parts[0].strip()
+        if not _LABEL_RE.match(label):
+            raise ValueError(
+                f"SERVICE_KEYS 的标签只允许字母/数字/下划线/短横（1-24 位）：{label!r}")
+        key = parts[1].strip()
+        if not key:
+            raise ValueError(f"SERVICE_KEYS 条目格式不对（缺 key）：{text[:24]}…")
+        quota = 0
+        if len(parts) == 3:
+            quota_raw = parts[2].strip()
+            try:
+                quota = int(quota_raw)
+            except ValueError as e:
+                raise ValueError(f"SERVICE_KEYS 的配额必须是整数：{quota_raw!r}") from e
+            if quota < 0:
+                raise ValueError(f"SERVICE_KEYS 的配额不能为负：{quota}")
+        out[key] = (label, quota)
+    return out
+
 
 
 def _csv(key: str) -> tuple[str, ...]:
@@ -381,6 +431,11 @@ class Settings:
             raise ConfigError("VIDEO_TASK_TIMEOUT 必须 > 0")
         if self.video_poll_interval <= 0:
             raise ConfigError("VIDEO_POLL_INTERVAL 必须 > 0")
+        if self.service_keys:
+            try:
+                parse_service_keys(self.service_keys)
+            except ValueError as e:
+                raise ConfigError(f"SERVICE_KEYS 配置不合法：{e}") from e
         if bool(self.tls_certfile) != bool(self.tls_keyfile):
             raise ConfigError(
                 "TLS_CERTFILE 与 TLS_KEYFILE 必须成对配置（当前只给了一个）—— "
@@ -420,4 +475,4 @@ class Settings:
         return self.hailuo_screen_width <= 0 or self.hailuo_screen_height <= 0
 
 
-__all__ = ["Settings", "ConfigError"]
+__all__ = ["Settings", "ConfigError", "parse_service_keys"]

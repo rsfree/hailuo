@@ -32,6 +32,7 @@ from typing import Any
 from loguru import logger
 
 from .accounts import AccountCipher, AccountStore
+from .config import parse_service_keys
 from .credentials import parse_jwt
 from .errors import AuthError, CredentialUnavailable
 
@@ -47,6 +48,9 @@ class Caller:
 
     credential_id: str
     owner_id: str
+    #: 服务 Key 的标签与每日配额（透传模式两者都为空/0）
+    label: str = ""
+    quota: int = 0
 
 
 class PoolAuth:
@@ -63,15 +67,25 @@ class PoolAuth:
     def service_keys(self) -> tuple[str, ...]:
         return tuple(self.settings.service_keys or ())
 
+    def spec_of(self, key: str) -> tuple[str, int] | None:
+        """常量时间匹配（不短路），命中返回 `(label, quota)`。"""
+        specs = parse_service_keys(self.service_keys)
+        hit: tuple[str, int] | None = None
+        for k, spec in specs.items():
+            if secrets.compare_digest(key, k):
+                hit = spec
+        return hit
+
     def resolve(self, key: str) -> Caller:
         if key.count(".") == 2:
             cred = self.service.register_credential(key)
             return Caller(credential_id=cred, owner_id=cred)
-        if not self._is_service_key(key):
+        spec = self.spec_of(key)
+        if spec is None:
             raise AuthError(
                 "Authorization 既不是 hailuo JWT（三段式），也不是本服务配置的服务 Key。"
                 "透传请传你的 hailuo 登录 token；号池请用 SERVICE_KEYS 里的 Key。")
-        return self._issue_from_pool(key)
+        return self._issue_from_pool(key, *spec)
 
     def _is_service_key(self, key: str) -> bool:
         #: 逐字常量时间比较：`in` 会短路，长度/前缀可被计时侧信道利用。
@@ -87,7 +101,7 @@ class PoolAuth:
         counts = self.service.store.active_counts_by_credential()
         return {fp for fp, n in counts.items() if fp and n >= limit}
 
-    def _issue_from_pool(self, key: str) -> Caller:
+    def _issue_from_pool(self, key: str, label: str, quota: int) -> Caller:
         if self.cipher is None:
             raise CredentialUnavailable(
                 "号池未配置加密主密钥（ACCOUNT_ENC_KEY），无法解密账号 token —— "
@@ -114,8 +128,10 @@ class PoolAuth:
         self.service.credentials.put(rec["fp"], token, claims)
         self.accounts.record_use(rec["id"])
         #: 归属 = **该服务 Key** 的指纹（不是账号指纹）：隔离的落点在这里。
-        return Caller(credential_id=rec["fp"],
-                      owner_id="svc-" + self.service.credential_of(key))
+        fp = self.service.credential_of(key)
+        owner = f"svc-{label}-{fp[:8]}" if label else "svc-" + fp
+        return Caller(credential_id=rec["fp"], owner_id=owner,
+                      label=label, quota=quota)
 
 
-__all__ = ["Caller", "PoolAuth"]
+__all__ = ["Caller", "PoolAuth", "parse_service_keys"]

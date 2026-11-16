@@ -322,7 +322,8 @@ def _install_routes(app: FastAPI) -> None:
         """
         svc: Service = request.app.state.service
         rec = svc.create(body.model_dump(), credential=caller.credential_id,
-                         owner=caller.owner_id)
+                         owner=caller.owner_id, quota=caller.quota,
+                         label=caller.label)
         # 叫醒协调器：不然这条任务要等到下一个 tick 才被发现（默认最多白等 1s）。
         request.app.state.coordinator.wake()
         return JSONResponse(
@@ -372,7 +373,8 @@ def _install_routes(app: FastAPI) -> None:
         try:
             svc: Service = request.app.state.service
             rec = svc.create(body.model_dump(), credential=caller.credential_id,
-                             owner=caller.owner_id)
+                             owner=caller.owner_id, quota=caller.quota,
+                         label=caller.label)
             coordinator.wake()
             rec = svc.wait_terminal(rec["task_id"], caller.owner_id,
                                     max_wait=settings.sync_max_wait)

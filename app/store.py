@@ -201,6 +201,16 @@ def new_video_task_id(*, now: float | None = None, suffix_len: int = 10) -> str:
     return f"cgt-{stamp}-{uuid.uuid4().hex[:suffix_len]}"
 
 
+class KeyUsageRow(Base):
+    """服务 Key 的每日用量。主键 `(owner_id, day)` ⇒ 跨天自然分区。"""
+
+    __tablename__ = "key_usage"
+
+    owner_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class TaskStore:
     """任务库。**所有对 tasks 表的读写都要经过这里。**"""
 
@@ -408,6 +418,42 @@ class TaskStore:
                 .group_by(self.row_cls.credential_id)
             ).all()
             return {(cred or ""): int(n) for cred, n in rows}
+
+    def consume_quota(self, owner_id: str, day: str, *, limit: int,
+                      requests: int = 1) -> bool:
+        """配额预扣：**检查与自增在同一个事务**里。
+
+        `limit<=0` ⇒ 不限（仍然记一行用量，便于面板看趋势）。
+        并发下（多 worker）可能极小概率多放过一两条：这里没有行锁；
+        SQLite 写事务本身就是串行的，Postgres 部署如需严格上限应改成
+        `SELECT … FOR UPDATE`。**不假装它是硬的**。
+        """
+        with self.session() as s:
+            row = s.get(KeyUsageRow, (owner_id, day))
+            if row is None:
+                row = KeyUsageRow(owner_id=owner_id, day=day, requests=0)
+                s.add(row)
+                s.flush()
+            if limit > 0 and row.requests + requests > limit:
+                return False
+            row.requests += requests
+            return True
+
+    def usage_of(self, owner_id: str, day: str) -> int:
+        with self.session() as s:
+            row = s.get(KeyUsageRow, (owner_id, day))
+            return int(row.requests) if row else 0
+
+    def counts(self) -> dict[str, int]:
+        """按状态聚合（面板概览用）。之前没有这个方法，概览里的 `tasks` 一直是空对象
+        —— 面板把异常静默吞了，看起来像"没有任务"，其实是"没实现"。"""
+        with self.session() as s:
+            rows = s.execute(
+                select(self.row_cls.status, func.count())
+                .group_by(self.row_cls.status)).all()
+        out = {str(st): int(n) for st, n in rows}
+        out["total"] = sum(out.values())
+        return out
 
     def count_queued(self) -> int:
         with self.session() as s:
