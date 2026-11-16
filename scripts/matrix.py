@@ -168,13 +168,39 @@ def collect_result(svc: Any, entry: dict) -> dict:
     return entry
 
 
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")   #: PNG / JPEG
+
+
+def _looks_like_image(raw: bytes) -> bool:
+    """魔术字节判定。CDN 出错时会回 HTML（实测 4KB 的 `<html>` 被存成 .png），
+    把错误页当产物 = 静默假成功，比下载失败严重得多。"""
+    if raw.startswith(_IMAGE_MAGIC[0]) or raw.startswith(_IMAGE_MAGIC[1]):
+        return True
+    return raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
+
+
+def _suffix(raw: bytes) -> str:
+    """按魔术字节定扩展名：上游产物可能是 **JPEG**（seedream 实测 2816×1536 .jpg），
+    统一存成 .png 会让下游按错误类型处理。"""
+    if raw.startswith(_IMAGE_MAGIC[0]):
+        return ".png"
+    if raw.startswith(_IMAGE_MAGIC[1]):
+        return ".jpg"
+    return ".webp"
+
+
 def download(name: str, idx: int, url: str) -> str:
     import httpx  # noqa: PLC0415
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUT_DIR / f"{name}-{idx}.png"
     r = httpx.get(url, timeout=30, follow_redirects=True)
-    path.write_bytes(r.content)
+    raw = r.content
+    if r.status_code != 200 or not _looks_like_image(raw):
+        raise RuntimeError(
+            f"产物不是图片（HTTP {r.status_code}, {len(raw)}B, "
+            f"content-type={r.headers.get('content-type')}）：{url}")
+    path = OUT_DIR / f"{name}-{idx}{_suffix(raw)}"
+    path.write_bytes(raw)
     return str(path)
 
 

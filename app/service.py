@@ -119,6 +119,16 @@ def _resolution_from_size(width: int, height: int) -> str:
     return "4K"
 
 
+#: 实测**不接受** `aspectRatio=Auto` 的上游模型（i2i 场景）。
+#:
+#: 2026-11-17 实测证据（同一 body 只改这一个字段）：
+#: `gpt-image-2.5-flare` + Auto ⇒ 上游 code=2「请求异常」；换成 `1:1` ⇒ 立即受理成功。
+#: 反例（同一批次里 Auto 成功）：`nano_banana21_flash`、`nano-banana2`、
+#: `seedream-5.0`、`mj_v7` ⇒ 所以这不是"Auto 一律不行"，而是**模型级差异**。
+#: 只把被证实不行的模型列进来：改动的面越小，越不需要重新取证其余模型。
+AUTO_RATIO_UNSUPPORTED = frozenset({"gpt-image-2.5-flare"})
+
+
 @dataclass
 class Plan:
     """一次生成任务在**上游侧**的完整形态。"""
@@ -668,12 +678,29 @@ class Service:
                 degradations.append(
                     f"【gpt-image 成本策略】上游恒按最便宜档生成（{'；'.join(forced)}）。")
 
-        # ---- Auto 只属于 i2i（2026-10-15 矩阵实测：t2i + Auto 上游 code=2）
-        if ratio == "Auto" and not image_urls:
-            ratio = None
-            degradations.append(
-                "aspect_ratio=Auto 是\"跟随参考图比例\"的 i2i 语义 ⇒ "
-                "文生图场景不发送该键（实测 t2i 带 Auto 会被上游 code=2 拒）。")
+        # ---- 文生图必须给**明确**比例（2026-11-16 真实矩阵实测纠正）
+        # 旧结论是"t2i 带 Auto 会被 code=2 拒 ⇒ 干脆不发送该键"，但实测**不发送**
+        # 同样被拒（同样的 code=2「请求异常」）：同模型带 1:1 立即成功（1024×1024）。
+        # ⇒ 比例对 t2i 是必填项，缺省/ Auto 都落到该模型支持的中性档，并留痕。
+        # ---- i2i 的 Auto：只在**已证实不接受**的模型上落到明确档
+        if (image_urls and ratio == "Auto"
+                and upstream_model in AUTO_RATIO_UNSUPPORTED):
+            supported = [r for r in (model_meta.aspect_ratios or ()) if r != "Auto"]
+            if supported:
+                picked = "1:1" if "1:1" in supported else supported[0]
+                degradations.append(
+                    f"{upstream_model} 实测不接受 aspect_ratio=Auto（上游 code=2）⇒ "
+                    f"落到 {picked}；如需跟随参考图比例请显式传 aspect_ratio。")
+                ratio = picked
+
+        if not image_urls and (ratio is None or ratio == "Auto"):
+            supported = [r for r in (model_meta.aspect_ratios or ()) if r != "Auto"]
+            if supported:
+                picked = "1:1" if "1:1" in supported else supported[0]
+                degradations.append(
+                    f"文生图必须给明确比例（上游对缺失/Auto 一律 code=2）⇒ "
+                    f"默认落到 aspect_ratio={picked}（该模型可选：{supported}）。")
+                ratio = picked
 
         # ---- referenceMode（**默认不发**）
         reference_mode = request.get("reference_mode")

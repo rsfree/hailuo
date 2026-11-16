@@ -184,10 +184,11 @@ def test_off_table_ratio_snaps_to_nearest() -> None:
             assert plan.aspect_ratio == expect, f"{raw} ⇒ {plan.aspect_ratio}"
             joined = " ".join(plan.degradations)
             assert "自动映射" in joined and raw in joined, raw
-        # i2i 的 Auto 保留、t2i 的 Auto 丢弃（防回归）
+        # t2i 的 Auto 必须落成**明确**比例（2026-11-16 实测：缺失/Auto 都被 code=2 拒）
         plan_a, _, _ = svc.build_plan(
             {"model": "gpt-image-2.5-flare", "prompt": "x", "aspect_ratio": "Auto"})
-        assert plan_a.aspect_ratio is None
+        assert plan_a.aspect_ratio == "1:1"
+        assert "文生图必须给明确比例" in " ".join(plan_a.degradations)
     finally:
         svc.close()
         m2.install_runtime_models([])
@@ -385,9 +386,11 @@ def test_defaults_pin_cheapest_tier(service) -> None:
     """
     plan, _, _ = service.build_plan({"prompt": "x"})
     assert plan.resolution == "1K"
-    assert plan.aspect_ratio is None  # Auto 是 i2i 语义 ⇒ t2i 不发送该键
+    #: t2i 必须带明确比例（缺失/Auto 会被上游 code=2 拒）⇒ 默认 1:1
+    assert plan.aspect_ratio == "1:1"
     joined = " ".join(plan.degradations)
     assert "写死最便宜档" in joined
+    assert "文生图必须给明确比例" in joined
     assert "defaultSelect" in joined          # 说明里仍交代上游默认是什么、为何不用
     assert "已不作为默认" in joined
     # nano 无 quality 维度 ⇒ 写死不适用于它，quality 不应出现
