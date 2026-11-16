@@ -59,7 +59,6 @@ def build_settings(*, coordinator: bool = False, token: str | None = None):
     st = Settings.from_env().replace(
         task_db=PROBE_DB,
         coordinator_enabled=coordinator,
-        api_keys=(),                       # 探针直连 Service，不走 HTTP 鉴权
         otel_token="",                     # 探针不上报
     )
     if token is not None:
@@ -161,13 +160,16 @@ def phase_accept(token: str) -> bool:
     from tests.conftest import FAKE_JWT
 
     app = create_app(st, service=svc)
-    svc.register_credential(FAKE_JWT)
+    #: 入口鉴权**只有两种**：hailuo JWT 透传，或 SERVICE_KEYS 里的服务 Key。
+    #: 有真 token 就用它（顺带验证真凭据能过本地校验），没有就退回合成 JWT。
+    key = token or FAKE_JWT
+    svc.register_credential(key)
     client = TestClient(app)
 
     r = client.post("/async/v1/images/generations",
                     json={"model": "hailuo-i2i", "prompt": "a cat",
                           "image": ["https://cdn.hailuoai.video/e2e-ref.png"]},
-                    headers={"Authorization": "Bearer sk-e2e"})
+                    headers={"Authorization": f"Bearer {key}"})
     body = r.json()
     ok = r.status_code == 202 and set(body) == {"task_id"}
     print(f"{OK if ok else NO} POST -> {r.status_code} {body}")
@@ -315,7 +317,12 @@ def phase_generate(token: str, image: str) -> bool:
             payload["image"] = [image]
             mode = "图生图(i2i)"
         print(f"  模式：{mode}  model=nano_banana21_flash  resolution=1K  n=1")
-        rec = svc.create(payload, credential=svc.credential_of(FAKE_JWT))
+        #: 真实 token ⇒ 必须**先登记进池**再提交：脚本直连 Service 时没有 HTTP
+        #: 鉴权层替我们 `register_credential()`，池里查不到该指纹会抛
+        #: `CredentialUnavailable`（503 语义，不是 401）。
+        credential = (svc.register_credential(token) if token
+                      else svc.credential_of(FAKE_JWT))
+        rec = svc.create(payload, credential=credential)
         print(f"  受理 {rec['task_id']}，正在建任务…")
         out = svc.submit(rec["task_id"])
         print(f"{OK if out.get('submitted') else NO} {out.get('upstream_batch_id') or out}")

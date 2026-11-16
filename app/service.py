@@ -51,6 +51,7 @@ from .config import Settings
 from .credentials import CredentialPool, parse_jwt
 from .errors import (
     AdapterError,
+    AuthError,
     CapabilityUnavailable,
     ContentPolicyError,
     InvalidParameterError,
@@ -58,6 +59,8 @@ from .errors import (
     TaskNotDeletable,
     TaskNotFoundError,
     CredentialUnavailable,
+    UpstreamQuotaExhausted,
+    UpstreamRateLimited,
 )
 from .gate import Gate, build as build_gate
 from .observability import OBS
@@ -274,6 +277,15 @@ class Service:
                                          cache_ttl=self.settings.upload_cache_ttl)
         return self._uploader
 
+    @property
+    def http_transport(self) -> Any:
+        """本服务注入的 httpx transport（测试/嵌入方用来**零出网**）。
+
+        面板巡检与选号探针复用它：否则"管理面板点一次巡检"就会成为
+        测试里唯一一条真实出网路径。
+        """
+        return self._http_transport
+
     def close(self) -> None:
         for name, obj in (("uploader", self._uploader), ("client", self._client)):
             if obj is None:
@@ -329,6 +341,35 @@ class Service:
         """全部**每账号**闸门的状态快照（观测用）。键 = 凭据指纹（不可逆哈希）。"""
         with self._gates_lock:
             return {cred: g.stats() for cred, g in self._gates.items()}
+
+    def note_account_failure(self, credential_id: str | None, err: Exception) -> None:
+        """把上游失败反馈给**号池**（透传模式没有账号表 ⇒ 空操作）。
+
+        映射依据上游语义，不是猜的：
+
+        - `AuthError`（401）⇒ 账号 token 已废 ⇒ `dead`；
+        - `UpstreamQuotaExhausted`（余额/贝壳不足）⇒ 冷却 6h，不判死（充值后仍可用）；
+        - `UpstreamRateLimited` / `RiskControlChallenge` ⇒ 按 `HL_COOLDOWN` 降温。
+
+        只影响**下一次选号**：不重试、不改写调用方看到的这次错误。
+        """
+        accounts = getattr(self, "accounts", None)
+        if accounts is None or not credential_id:
+            return
+        rec = accounts.get_by_fp(credential_id)
+        if rec is None:
+            return
+        if isinstance(err, AuthError):
+            accounts.record_failure(rec["id"], error=str(err), fatal=True)
+            logger.warning(f"号池账号 {rec['id'][:8]} 判失效（上游 401）：{err}")
+        elif isinstance(err, UpstreamQuotaExhausted):
+            accounts.record_failure(rec["id"], error=str(err), cooldown=6 * 3600.0)
+            logger.warning(f"号池账号 {rec['id'][:8]} 余额不足，冷却 6h：{err}")
+        elif isinstance(err, (UpstreamRateLimited, RiskControlChallenge)):
+            accounts.record_failure(rec["id"], error=str(err),
+                                    cooldown=self.settings.hl_cooldown)
+            logger.warning(f"号池账号 {rec['id'][:8]} 限流/风控，"
+                           f"冷却 {self.settings.hl_cooldown:.0f}s：{err}")
 
     def register_credential(self, token: str) -> str:
         """校验并登记一个**透传凭据**，返回凭证指纹。
@@ -906,18 +947,24 @@ class Service:
             raise
 
         # ② 建任务
-        batch_id, trace = client.create_image(
-            model_id=plan["upstream_model"],
-            desc=plan.get("desc") or "",
-            file_list=file_list,
-            quantity=int(plan.get("quantity") or 1),
-            aspect_ratio=plan.get("aspect_ratio"),
-            resolution=plan.get("resolution"),
-            quality=plan.get("quality"),
-            reference_mode=plan.get("reference_mode"),
-            use_origin_prompt=bool(plan.get("use_origin_prompt", True)),
-            dry_run=dry_run,
-        )
+        #: 🔴 失败要**回灌号池**：账号被上游拒（401/余额/限流）时必须让它冷下来，
+        #: 否则下一轮还会挑中同一个死号，把失败变成匀速的重复计费尝试。
+        try:
+            batch_id, trace = client.create_image(
+                model_id=plan["upstream_model"],
+                desc=plan.get("desc") or "",
+                file_list=file_list,
+                quantity=int(plan.get("quantity") or 1),
+                aspect_ratio=plan.get("aspect_ratio"),
+                resolution=plan.get("resolution"),
+                quality=plan.get("quality"),
+                reference_mode=plan.get("reference_mode"),
+                use_origin_prompt=bool(plan.get("use_origin_prompt", True)),
+                dry_run=dry_run,
+            )
+        except AdapterError as e:
+            self.note_account_failure(full.get("credential_id"), e)
+            raise
         OBS.upstream("create_image", task_id=task_id, **trace)
 
         if dry_run:

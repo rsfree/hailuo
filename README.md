@@ -54,6 +54,9 @@ GET    /v1/models                                → OpenAI 形态清单（图�
 | 改图片响应形状 | `app/service.py::view` —— **唯一出口** |
 | 改埋点 | `app/observability.py` —— **唯一收拢点** |
 | 核对上游视频模型清单/价格（**零计费**） | `scripts/probe_video.py` |
+| 管号池 / 改面板 | `app/panel.py` + `app/panel/`（静态页） |
+| 改账号加密或选号 | `app/accounts.py`（密文/权重/冷却都在这里） |
+| 改入口鉴权（透传 vs 池化） | `app/poolauth.py` |
 
 ---
 
@@ -283,6 +286,63 @@ curl -s localhost:8300/v1/models | jq '.data[].id'
 
 ---
 
+## 3.95 管理面板与号池
+
+面板是**号池的操作面**，不是装饰：账号的增删、停用、巡检、概览都在这里。
+
+```bash
+# 两个环境变量决定它存不存在
+export ADMIN_TOKEN='<面板口令>'                      # 空 ⇒ /panel 404
+export ACCOUNT_ENC_KEY="$(python -c 'import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+export SERVICE_KEYS='sk-…'                          # 可选：池化出号（留空=只透传）
+curl -s localhost:8300/panel                        # 浏览器打开即可
+```
+
+**面板能力**（全部经 `ADMIN_TOKEN` 会话校验，Cookie 签名 TTL 12h）：
+
+| 动作 | 端点 |
+|---|---|
+| 登录 / 登出 | `POST /panel/api/login` · `POST /panel/api/logout` |
+| 列表 / 新增 / 删除 | `GET/POST /panel/api/accounts` · `DELETE /panel/api/accounts/{id}` |
+| 停用 / 启用 | `POST /panel/api/accounts/{id}/status` |
+| 批量导入 | `POST /panel/api/accounts/import`（每行 `备注<Tab>token` 或裸 token） |
+| 巡检（单个 / 全部） | `POST /panel/api/accounts/{id}/check` · `.../check_all` |
+| 概览 | `GET /panel/api/overview` |
+
+**入口鉴权两条路，判据是 token 形态**（细节见 `app/poolauth.py`）：
+
+1. **透传**：三段式 JWT ⇒ 该 token 就是上游凭证，费用记在调用方账上（旧行为，逐字不变）；
+2. **池化**：逐字命中 `SERVICE_KEYS` ⇒ 服务从号池挑号，费用记在号主账上。
+
+失败语义刻意分开：Key 不认识 ⇒ **401 `invalid_api_key`**；号池没有可用号 ⇒
+**503 `credential_unavailable`**。**绝不"取号失败就回落透传"**——那会把一次本该 401 的请求
+变成一次记在服务账号上的计费动作。
+
+**加密与密钥纪律**（这条改变了旧铁律，写清楚）：
+
+- 账号 token 以 **AES-256-GCM** 信封加密落库（`v1.<base64url(nonce|ct)>`），
+  主密钥来自 `ACCOUNT_ENC_KEY`、**不入库**；库里另有 `HMAC-SHA256(secret, token)` 指纹，
+  任务归属仍用指纹，**不解密也能查归属**；
+- 面板与所有 API 响应**永不回显明文**（列表里连 `token_enc` 字段都没有）；
+- 密钥换了 ⇒ 旧密文解不开，接口会明确报"密文无法解密"，**不会静默换号**。
+
+**巡检是零成本的**：走 `my/processing`（只回答"有没有在跑的任务"），不建任务、不计费。
+把巡检做成计费动作，等于每次点按钮都在烧钱。
+
+**失败会回灌号池**（`Service.note_account_failure`）：上游 401 ⇒ 账号判 `dead`；
+余额/贝壳不足 ⇒ 冷却 6h；429/风控 ⇒ 按 `HL_COOLDOWN` 降温。只影响**下次选号**，
+不重试、不改写调用方看到的错误。
+
+**选号判据**：`active` + 未过期 + 不在冷却，按 **权重降序 → 最久未用 → 最早到期** 取第一个。
+最早到期者先用，是为了不让快到期的余额烂在库里。
+
+**已知边界（不粉饰）**：
+
+- 池化模式下任务按**账号**归属 ⇒ 多个服务 Key 共用同一账号时会看到彼此的任务（单租户假设）；
+  多租户隔离要给任务表加 owner 列，本期未做；
+- 面板本身不做 TLS，生产请在网关层终结 HTTPS 并叠加 IP 白名单；
+- 只有单管理员口令，没有多用户/审计日志（每个动作只留一行 loguru 摘要）。
+
 ## 4. 扩容前必读
 
 **默认 `WORKERS=1` 是架构约束，不是保守参数：**
@@ -397,6 +457,10 @@ app/
   gate.py             节奏闸门（间隔 / 每分钟上限 / 风控冷却）
   store.py            SQLAlchemy 任务存储（tasks / video_tasks 两表同一实现）+ 租约
   observability.py    logfire + loguru 单一收拢点
+  accounts.py         **号池**：AES-GCM 密文 / 指纹 / 权重 / 冷却 / 选号
+  poolauth.py         入口鉴权：JWT 透传 或 服务 Key 从池取号
+  panel.py            管理面板 API（会话 / 账号 CRUD / 零成本巡检）
+  panel/              面板静态页（index.html + app.js + style.css，无构建步骤）
   upstream/hailuo/    sign（yy 签名）/ client / upload（OSS STS）/ capabilities
                       + video_models（视频注册表与族路由）/ video_capabilities
 tests/                见 §5

@@ -211,6 +211,15 @@ class Settings:
     port: int = 8300
     log_level: str = "INFO"
 
+    # ------------------------------------------------------------ 管理面板 / 号池
+    #: 面板口令。**空 ⇒ 不挂载 `/panel`（404）** —— 不做默认口令，也不开匿名面板。
+    admin_token: str = ""
+    #: 号池主密钥（32 字节，hex 或 base64）。空 ⇒ 账号的读/写一律拒绝并说明原因。
+    #: **它必须来自环境变量，绝不入库**：密钥与密文放同一个库里等于没加密。
+    account_enc_key: str = ""
+    #: 池化出号的服务端 Key（逗号分隔）。空 ⇒ 只支持透传（与旧行为完全一致）。
+    service_keys: tuple[str, ...] = ()
+
     startup_warnings: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ 派生
@@ -324,6 +333,10 @@ class Settings:
             host=_s("HOST", "0.0.0.0"),
             port=_i("PORT", 8300),
             log_level=_s("LOG_LEVEL", "INFO").upper(),
+
+            admin_token=_s("ADMIN_TOKEN"),
+            account_enc_key=_s("ACCOUNT_ENC_KEY"),
+            service_keys=_csv("SERVICE_KEYS"),
         )
         st.validate()
         return st
@@ -374,6 +387,14 @@ class Settings:
             self.startup_warnings.append(
                 "COORDINATOR_ENABLED=0 —— 任务只会停在 queued，**永远不会建到上游**。"
                 "仅用于冒烟/自检。")
+        if self.service_keys and not self.account_enc_key:
+            self.startup_warnings.append(
+                "SERVICE_KEYS 已配置，但 ACCOUNT_ENC_KEY 为空 ⇒ 号池无法解密账号，"
+                "池化请求会以 503 credential_unavailable 失败（不会回落透传）。")
+        if self.admin_token and not self.account_enc_key:
+            self.startup_warnings.append(
+                "ADMIN_TOKEN 已配置，但 ACCOUNT_ENC_KEY 为空 ⇒ 面板能登录，"
+                "但账号增删会 503。")
 
     def hailuo_max_side_guard(self) -> bool:
         return self.hailuo_screen_width <= 0 or self.hailuo_screen_height <= 0

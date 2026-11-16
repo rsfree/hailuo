@@ -26,5 +26,8 @@ pillow==11.3.0
 loguru==0.7.3
 logfire==4.16.0
 
+# --- 号池：账号 token 的 AES-256-GCM 信封加密（主密钥来自 ACCOUNT_ENC_KEY）
+cryptography==50.0.2
+
 # --- 生产进程管理（容器里用它起多 worker；见 README 的扩容约束）
 gunicorn==23.0.0

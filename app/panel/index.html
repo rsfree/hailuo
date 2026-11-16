@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hailuo 号池面板</title>
+<link rel="stylesheet" href="/panel/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>hailuo 号池面板</div>
+  <div class="top-actions">
+    <span id="mode-badge" class="badge badge-muted">未登录</span>
+    <button id="btn-logout" class="btn btn-ghost" hidden>退出</button>
+  </div>
+</header>
+
+<main>
+  <!-- 登录 -->
+  <section id="login-view" class="card login-card">
+    <h1>管理员登录</h1>
+    <p class="hint">口令来自服务端环境变量 <code>ADMIN_TOKEN</code>。未配置时面板不会挂载（404）。</p>
+    <form id="login-form" autocomplete="off">
+      <input id="login-token" type="password" placeholder="ADMIN_TOKEN" required>
+      <button class="btn btn-primary" type="submit">登录</button>
+    </form>
+    <p id="login-error" class="error" hidden></p>
+  </section>
+
+  <!-- 面板主体 -->
+  <div id="dash" hidden>
+    <section class="stats" id="stats"></section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>添加账号</h2>
+        <span class="hint">粘贴 hailuo 登录 JWT（localStorage 里的 token）。落库前加密，列表永不回显。</span>
+      </div>
+      <form id="add-form" class="row-form" autocomplete="off">
+        <input id="add-label" type="text" placeholder="备注名（可选）">
+        <input id="add-token" type="password" placeholder="eyJhbGciOi…" required>
+        <button class="btn btn-primary" type="submit">添加</button>
+      </form>
+
+      <details class="import">
+        <summary>批量导入（每行一个 token，可写成 <code>备注&lt;Tab&gt;token</code>）</summary>
+        <textarea id="import-text" rows="5" placeholder="主号&#9;eyJhbGciOi…&#10;备用号&#9;eyJhbGciOi…"></textarea>
+        <button id="btn-import" class="btn" type="button">导入</button>
+        <pre id="import-result" class="mono" hidden></pre>
+      </details>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>号池</h2>
+        <div class="card-actions">
+          <button id="btn-check-all" class="btn">全部巡检（零成本）</button>
+          <button id="btn-refresh" class="btn btn-ghost">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="accounts">
+          <thead>
+            <tr>
+              <th>备注</th><th>账号</th><th>状态</th><th>到期</th>
+              <th>权重</th><th>用量</th><th>最近巡检</th><th class="right">操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="empty-hint" class="hint" hidden>号池还是空的 —— 先添加一个账号。</p>
+    </section>
+  </div>
+</main>
+
+<footer class="foot">
+  <span>巡检走 <code>my/processing</code>：不建任务、不计费。</span>
+</footer>
+
+<script src="/panel/app.js"></script>
+</body>
+</html>

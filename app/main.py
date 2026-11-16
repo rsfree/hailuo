@@ -33,6 +33,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import models
+from .accounts import AccountCipher, AccountStore
 from .config import Settings
 from .coordinator import Coordinator
 from .errors import (
@@ -43,6 +44,8 @@ from .errors import (
     SyncUnavailable,
 )
 from .observability import OBS, excluded_urls, is_probe_path, setup_logging, should_log_path
+from .panel import install_panel
+from .poolauth import PoolAuth
 from .seedance_api import install_video_routes
 from .service import Service, view
 from .video_service import VideoService
@@ -106,24 +109,21 @@ def _bearer(request: Request) -> str | None:
 
 
 def require_key(request: Request) -> str:
-    """校验调用方凭据，返回**凭证指纹**（不是明文）。
+    """把入口 Bearer 解析成**凭证指纹**（不是明文）。两条路见 `app/poolauth.py`：
 
-    ## 唯一的入口鉴权方式：**hailuo JWT 透传**（2026-09-21 起）
-
-    `Authorization: Bearer <你的 hailuo 登录 token>` —— 该 token **同时就是上游凭证**：
-    任务全程（建任务/轮询/OSS 上传）都用它 ⇒ **费用记在 token 所有者账上**。
-    服务端不持有任何账号凭据，因此**无需也不支持**白名单 key。
+    - **透传**（三段式 JWT）⇒ 该 token 同时就是上游凭证，费用记在调用方账上；
+    - **池化**（命中 `SERVICE_KEYS`）⇒ 服务从号池挑一个账号，费用记在号主账上。
 
     本地只做"结构 + `exp`"校验（**不验签** —— 没有签名密钥）：
     伪造/过期 token 会在上游拿到 401，本地这层是为了早失败、少一次往返。
     """
-    service: Service = request.app.state.service
     key = _bearer(request)
     if not key:
         raise AuthError(
             "缺少 Authorization: Bearer <token> —— 请传你的 hailuo 登录 token"
             "（浏览器 F12 里任意请求的 `token` 头 / JWT 形态的那串）。")
-    return service.register_credential(key)
+    pool_auth: PoolAuth = request.app.state.pool_auth
+    return pool_auth.resolve(key)
 
 
 def require_key_optional(request: Request) -> str | None:
@@ -213,6 +213,21 @@ def create_app(settings: Settings | None = None,
     _install_request_logging(app)
     _install_routes(app)
     install_video_routes(app)
+
+    #: 号池与面板：**共用任务库的引擎**（不另开连接池）；指纹函数与 Service 同一实现，
+    #: 否则任务归属键和账号指纹对不上，池化模式下每条任务都会被判成"别人的"。
+    cipher: AccountCipher | None = None
+    if settings.account_enc_key:
+        cipher = AccountCipher.from_key_text(settings.account_enc_key)
+    accounts = AccountStore(service.store.engine, fingerprint=service.credential_of)
+    #: 让 Service 能把上游失败**回灌号池**（只影响下次选号，见 note_account_failure）。
+    service.accounts = accounts
+    app.state.accounts = accounts
+    app.state.cipher = cipher
+    app.state.pool_auth = PoolAuth(settings=settings, service=service,
+                                   accounts=accounts, cipher=cipher)
+    app.state.panel_enabled = install_panel(
+        app, settings=settings, service=service, accounts=accounts, cipher=cipher)
 
     for w in settings.startup_warnings:
         logger.warning(w)
