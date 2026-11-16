@@ -345,6 +345,40 @@ def test_coordinator_submits_and_polls_in_one_tick(service, fake) -> None:
     assert service.store.count_active() == 0
 
 
+def test_concurrency_is_per_account(service, fake) -> None:
+    """`HL_CONCURRENCY` 是**每个号**的槽位，不是全局：两个号各 4 ⇒ 一轮最多 8 条。
+
+    这条用例存在的理由：单看代码 `slots = concurrency - active[credential]` 很容易
+    被后人"顺手"改成全局计数，而回归测试若只有单账号场景，改坏了也看不出来。
+    """
+    from app.coordinator import Coordinator
+    from app.upstream.hailuo.client import ST_CREATING
+
+    #: 让上游停在"进行中"：否则假上游会立刻判成功、槽位当轮就释放，
+    #: 槽位数根本观测不到（首版用例就是这么写错的）。
+    real_set_feed = fake.set_feed
+
+    def stuck(batch_id: str, **_kw) -> None:
+        real_set_feed(batch_id, status=ST_CREATING, url="")
+
+    fake.set_feed = stuck  # type: ignore[method-assign]
+
+    service.settings = service.settings.replace(hl_concurrency=4)
+    for cred, count in (("acct-a", 6), ("acct-b", 6)):
+        for i in range(count):
+            service.create({"prompt": f"{cred}-{i}"}, credential=cred)
+    coord = Coordinator(service, service.settings)
+    coord.tick()
+    assert coord.stats.submitted == 8, "两个号各 4 条，共 8 条"
+    counts = service.store.active_counts_by_credential()
+    assert counts.get("acct-a") == 4 and counts.get("acct-b") == 4
+    assert service.store.count_queued() == 4, "每号各有 2 条留在队列"
+
+    coord.tick()
+    assert coord.stats.submitted == 8, "槽位已满 ⇒ 本轮不再提交"
+    assert service.store.count_queued() == 4
+
+
 def test_coordinator_respects_concurrency(service, fake) -> None:
     from app.coordinator import Coordinator
 

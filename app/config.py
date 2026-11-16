@@ -451,7 +451,8 @@ class Settings:
                 "但 scripts/ 下的运维脚本与嵌入模式需要它。")
         if self.hl_concurrency > 2:
             self.startup_warnings.append(
-                f"HL_CONCURRENCY={self.hl_concurrency} 超过本项目实测验证过的上限（2）。"
+                f"HL_CONCURRENCY={self.hl_concurrency}（**每个号**的并发）超过本项目"
+                "实测验证过的上限（2）：上游并发上限至今未界定，这是策略选择而非实测结论。"
                 "hailuo 是计费上游，并发直接放大额度消耗速率与风控暴露面。")
         if not self.coordinator_enabled:
             self.startup_warnings.append(
