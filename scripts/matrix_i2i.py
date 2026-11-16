@@ -21,7 +21,7 @@
 | 用例 | 期望 |
 |---|---|
 | `i2i-over-limit-15` | flash 15 张（超 14）⇒ `400`，信息带上限 |
-| `i2i-over-limit-gpt-4` | gpt-image-1.5 4 张（超 3）⇒ `400` |
+| `i2i-over-limit-gpt-17` | gpt-image-1.5 定向到 flare（上限 16）⇒ 17 张 `400` |
 
 执行模型与 `matrix.py` 一致：**Phase A 全部提交 → Phase B 单一轮询循环收口**。
 结果：产物下载到 `e2e-output/i2i/`，汇总 JSON 落 `e2e-output/i2i-result.json`。
@@ -36,7 +36,10 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor  # noqa: F401 —— 与 matrix 同构留用
+from io import BytesIO
 from pathlib import Path
+
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -90,12 +93,41 @@ def ref_pool(limit: int) -> list[str]:
                 pool.append(u)
             if len(pool) >= limit:
                 return pool
+    #: 历史产物不够就合成补足：宁可跑"合成参考图"的多参考形态，
+    #: 也不要因为环境干净就在 pool[3] 上崩掉。
+    if len(pool) < limit:
+        pool.extend(synth_refs(limit - len(pool), start=len(pool)))
     return pool
 
 
 def local_data_url() -> str:
-    raw = pathlib.Path(LOCAL_PNG).read_bytes()
+    path = pathlib.Path(LOCAL_PNG)
+    if not path.is_file():
+        raise SystemExit(
+            f"缺少本地样图 {LOCAL_PNG}（'本地图片'形态要用它转 base64）。\n"
+            "先跑一次 `python scripts/matrix.py --allow-real-submit --cases t2i-1k`，"
+            "或把任意 PNG 放到该路径。")
+    raw = path.read_bytes()
     return f"data:image/png;base64,{base64.b64encode(raw).decode()}"
+
+
+def synth_refs(count: int, *, start: int = 0) -> list[str]:
+    """本地合成**互异**参考图（内联 data URL）。
+
+    为什么需要：`ref_pool` 依赖内置 3 张 + 历史成功任务；新环境里历史库是空的，
+    池子凑不到 15 张 ⇒ 旧实现只打印一句警告，随后 `pool[3]` 直接 IndexError。
+    合成图上传免费、不走 CDN，足以补齐"张数"这条语义（`maxSupportImageCount`
+    校验、fileList 顺序、多路 ingest 并行度）。
+    """
+    out: list[str] = []
+    for i in range(count):
+        k = start + i
+        img = Image.new("RGB", (64, 64),
+                        ((37 * k + 20) % 256, (73 * k + 40) % 256, (109 * k + 60) % 256))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        out.append("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+    return out
 
 
 def build_cases(pool: list[str]) -> list[tuple[str, dict]]:
@@ -141,8 +173,12 @@ def negative_checks(svc: object, pool: list[str], credential: str) -> list[dict]
     for name, body in (
         ("i2i-over-limit-15",
          {"model": "nano_banana21_flash", "prompt": "x", "image": pool[:15]}),
-        ("i2i-over-limit-gpt-4",
-         {"model": "gpt-image-1.5", "prompt": "x", "image": pool[:4]}),
+        #: ⚠️ gpt-image-1.5 会被**定向**到 gpt-image-2.5-flare（成本策略，进 degradations），
+        #: 而 flare 的垫图上限是 **16** ⇒ 必须 17 张才真正越界。
+        #: 旧版用 4 张（按 gpt-image-1.5 声明的 3 张算）在定向策略落地后**已失效**：
+        #: 它把一个合法请求判成"未拦截"，属于用例过期，不是实现缺陷。
+        ("i2i-over-limit-gpt-17",
+         {"model": "gpt-image-1.5", "prompt": "x", "image": pool[:17]}),
         #: 主体参考模型（image-01）带参考图 ⇒ 必须**本地**拒绝（实测上游 code 2400052）
         ("i2i-subject-ref-model",
          {"model": "image-01", "prompt": "x", "image": [pool[0]]}),
@@ -232,8 +268,11 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict] = []
     try:
         pool = ref_pool(limit=20)  # ⚠️ 必须 >14：超限负例要凑够 15 张才有意义
-        if len(pool) < 15:
-            print(f"⚠️ 参考图池只有 {len(pool)} 张（<15）—— 超限负例会失去意义")
+        real = sum(1 for u in pool if u.startswith("http"))
+        synth = len(pool) - real
+        print(f"  参考图池 {len(pool)} 张：真实 {real} + 合成 {synth}")
+        #: 用例里最深的下标是 pool[4] 与 pool[3:6] ⇒ 少于 6 张连构造都会崩。
+        assert len(pool) >= 6, f"参考图池只有 {len(pool)} 张，不足以构造用例" 
         cases = build_cases(pool)
         if args.cases:
             want = {c.strip() for c in args.cases.split(",") if c.strip()}
