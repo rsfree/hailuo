@@ -44,6 +44,7 @@ import secrets
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import date, timedelta
 from typing import Any, Iterator
 
 from loguru import logger
@@ -607,6 +608,190 @@ class TaskStore:
             row = s.get(LeaseRow, leader_key)
             if row and row.owner == owner:
                 row.expires_at = 0.0
+
+    # ------------------------------------------------------------------ 观测
+    # 以下方法**只读**，专供面板 `/panel/api/*`：不改状态，也不吐请求体原文。
+
+    @staticmethod
+    def _brief(row: Any) -> dict[str, Any]:
+        """列表行：在 `to_dict()` 上补「错误摘要 + 已耗时」。
+
+        `to_dict()` 刻意不带 request/plan/result/error（列表接口不该吐请求体），
+        但运维要一眼看出「为什么失败」⇒ 这里只补**截断后的**错误消息。
+        """
+        d = row.to_dict()
+        brief = ""
+        if row.error_json:
+            try:
+                err = json.loads(row.error_json)
+            except ValueError:
+                err = None
+            if isinstance(err, dict):
+                brief = str(err.get("message") or err.get("code") or "")
+            elif err:
+                brief = str(err)
+        d["error_brief"] = brief[:160]
+        started = row.submitted_at or row.created_at
+        d["duration"] = round(max(0.0, (row.finished_at or time.time()) - started), 1)
+        return d
+
+    def recent_tasks(self, *, limit: int = 50, offset: int = 0,
+                     status: str = "", model: str = "", q: str = "",
+                     since: float | None = None) -> dict[str, Any]:
+        """分页 + 筛选的任务列表（面板「任务」视图）。"""
+        cls = self.row_cls
+        conds: list[Any] = []
+        if status:
+            conds.append(cls.status == status)
+        if model:
+            conds.append(cls.model == model)
+        if since is not None:
+            conds.append(cls.created_at >= since)
+        if q:
+            like = f"%{q}%"
+            conds.append(or_(cls.task_id.like(like),
+                             cls.owner_id.like(like),
+                             cls.upstream_batch_id.like(like)))
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        with self.session() as s:
+            total = int(s.scalar(
+                select(func.count()).select_from(cls).where(*conds)) or 0)
+            rows = s.scalars(
+                select(cls).where(*conds).order_by(cls.created_at.desc())
+                .limit(limit).offset(offset)).all()
+            items = [self._brief(r) for r in rows]
+        return {"items": items, "total": total,
+                "limit": limit, "offset": offset}
+
+    def faceted_counts(self, *, since: float | None = None) -> dict[str, Any]:
+        """状态与模型的分布 —— 筛选器上的数字，不是另一次全表扫描。"""
+        cls = self.row_cls
+        conds = [cls.created_at >= since] if since is not None else []
+        with self.session() as s:
+            by_status = s.execute(
+                select(cls.status, func.count()).where(*conds)
+                .group_by(cls.status)).all()
+            by_model = s.execute(
+                select(cls.model, func.count()).where(*conds)
+                .group_by(cls.model).order_by(func.count().desc())).all()
+        return {
+            "status": {str(k): int(v) for k, v in by_status},
+            "model": [{"model": str(k or "（未记录）"), "count": int(v)}
+                      for k, v in by_model if v],
+        }
+
+    def daily_series(self, *, days: int = 7) -> list[dict[str, Any]]:
+        """按**本地自然日**聚合；没有任务的日子也要补出来，否则曲线会骗人。"""
+        days = max(1, min(int(days), 90))
+        now = time.time()
+        since = now - days * 86400
+        with self.session() as s:
+            rows = s.execute(
+                select(self.row_cls.created_at, self.row_cls.status)
+                .where(self.row_cls.created_at >= since)).all()
+        buckets: dict[str, dict[str, Any]] = {}
+        for i in range(days - 1, -1, -1):
+            key = time.strftime("%Y-%m-%d", time.localtime(now - i * 86400))
+            buckets[key] = {"day": key, "total": 0, "succeeded": 0,
+                            "failure": 0, "in_progress": 0, "queued": 0}
+        for created, status in rows:
+            b = buckets.get(time.strftime("%Y-%m-%d", time.localtime(created)))
+            if b is None:
+                continue
+            b["total"] += 1
+            if str(status) in b:
+                b[str(status)] += 1
+        return list(buckets.values())
+
+    def latency_summary(self, *, since: float | None = None) -> dict[str, Any]:
+        """成功任务耗时（秒，从提交到终态）。样本少于 20 时 p95 ≈ max，别过度解读。"""
+        cls = self.row_cls
+        conds = [cls.status == ST_SUCCEEDED, cls.finished_at.is_not(None)]
+        if since is not None:
+            conds.append(cls.created_at >= since)
+        with self.session() as s:
+            rows = s.execute(
+                select(cls.created_at, cls.submitted_at, cls.finished_at)
+                .where(*conds)).all()
+        vals = sorted(max(0.0, f - (sub or c)) for c, sub, f in rows if f)
+        if not vals:
+            return {"count": 0, "p50": None, "p95": None, "max": None, "avg": None}
+
+        def pct(p: float) -> float:
+            idx = min(len(vals) - 1, max(0, int(round((len(vals) - 1) * p / 100))))
+            return round(vals[idx], 1)
+
+        return {"count": len(vals), "p50": pct(50), "p95": pct(95),
+                "max": round(vals[-1], 1),
+                "avg": round(sum(vals) / len(vals), 1)}
+
+    def failure_reasons(self, *, since: float | None = None,
+                        limit: int = 8, scan: int = 500) -> list[dict[str, Any]]:
+        """失败原因 Top N（按 `error_json.message` 聚类）。
+
+        聚合放在 Python 里做：`error_json` 是自由文本，SQL 侧跨 SQLite/Postgres
+        做不了统一的分组键。只扫最近 `scan` 条失败任务，够定位主要矛盾。
+        """
+        cls = self.row_cls
+        conds = [cls.status == ST_FAILURE]
+        if since is not None:
+            conds.append(cls.created_at >= since)
+        with self.session() as s:
+            rows = s.scalars(
+                select(cls.error_json).where(*conds)
+                .order_by(cls.created_at.desc()).limit(scan)).all()
+        buckets: dict[str, int] = {}
+        for raw in rows:
+            msg = ""
+            if raw:
+                try:
+                    err = json.loads(raw)
+                except ValueError:
+                    err = None
+                if isinstance(err, dict):
+                    msg = str(err.get("message") or err.get("code") or "")
+                elif err:
+                    msg = str(err)
+            key = (msg or "（无错误信息）").strip()[:80]
+            buckets[key] = buckets.get(key, 0) + 1
+        top = sorted(buckets.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+        return [{"reason": k, "count": v} for k, v in top]
+
+    def usage_series(self, *, days: int = 7) -> dict[str, Any]:
+        """按服务 Key 与自然日的**受理次数**（`key_usage`）。
+
+        口径提醒：这是每日配额的扣减单位（受理一次算一次），**不是出图张数**。
+        """
+        days = max(1, min(int(days), 90))
+        today = date.today()
+        start = (today - timedelta(days=days - 1)).isoformat()
+        with self.session() as s:
+            rows = s.execute(
+                select(KeyUsageRow.owner_id, KeyUsageRow.day,
+                       KeyUsageRow.requests)
+                .where(KeyUsageRow.day >= start)).all()
+        by_owner: dict[str, dict[str, Any]] = {}
+        by_day: dict[str, int] = {}
+        for owner, day, req in rows:
+            o = by_owner.setdefault(str(owner), {"owner_id": str(owner),
+                                                 "requests": 0, "days": 0,
+                                                 "last_day": ""})
+            o["requests"] += int(req)
+            o["days"] += 1
+            if str(day) > o["last_day"]:
+                o["last_day"] = str(day)
+            by_day[str(day)] = by_day.get(str(day), 0) + int(req)
+        order = [(today - timedelta(days=i)).isoformat()
+                 for i in range(days - 1, -1, -1)]
+        return {
+            "days": days,
+            "start": start,
+            "total": sum(o["requests"] for o in by_owner.values()),
+            "by_owner": sorted(by_owner.values(),
+                               key=lambda x: x["requests"], reverse=True),
+            "by_day": [{"day": d, "requests": by_day.get(d, 0)} for d in order],
+        }
 
     # ------------------------------------------------------------------ 统计
 

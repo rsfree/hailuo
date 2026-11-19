@@ -423,11 +423,17 @@ HAILUO_API_KEYS=tenant-a:sk-aaa:200,tenant-b:sk-bbb
 
 ## 3.99 入口暴露面（部署后必查）
 
-**规则：运维面在入口层 `return 404`，面板只走 SSH 隧道。**
+**规则：`/panel` 公网可达，其余运维面在入口层 `return 404`。**
 
-公网必须不可达：`/panel`、`/panel/*`、`/stats`、`/docs`、`/redoc`、`/openapi.json`
+公网必须不可达：`/stats`、`/docs`、`/redoc`、`/openapi.json`
 （自动文档同属运维面 —— 它把完整参数面交给任何扫描器）。
-公网必须可用：`/healthz`、`/readyz`、`/async/v1/models`。
+公网必须可用：`/healthz`、`/readyz`、`/async/v1/models`、`/panel`。
+
+> **口径变更 2026-11-19（用户决策，参考 workbuddy2api）**：面板由「只走 SSH 隧道」
+> 改为**公网开放**，且 `ADMIN_TOKEN` 与服务 Key 同值（`sk-hailuo`）。
+> 代价必须写清楚：**持有服务 Key 的调用方 = 管理员**（能加号/停号/触发巡检/看用量）；
+> 登录接口没有失败锁定，爆破防护只剩"Key 本身的熵"与网关限流。
+> 因此服务 Key 的发放范围 = 管理面信任半径，不得再当"给调用方随便发的 token"用。
 
 ```bash
 python scripts/check_ingress.py https://hailuo.1task.cn   # 任一不符 ⇒ 退出码 1
@@ -436,18 +442,18 @@ python scripts/check_ingress.py https://hailuo.1task.cn   # 任一不符 ⇒ 退
 nginx 侧写法（`/www/server/panel/vhost/nginx/hailuo.1task.cn.conf`，`location /` 之前）：
 
 ```nginx
-location = /panel        { return 404; }
-location ^~ /panel/      { return 404; }
 location = /stats        { return 404; }
 location = /docs         { return 404; }
 location = /redoc        { return 404; }
 location = /openapi.json { return 404; }
 ```
 
-面板访问走隧道（**唯一入口**）：
+面板入口：**`https://<域名>/panel`**，登录口令即服务 Key（`sk-` + 二级域名）。
+
+隧道方式仍保留，用于入口被误改或需要绕开公网时的救援：
 
 ```bash
-ssh -N -L 18300:127.0.0.1:8300 root@<host>
+ssh -J jump -N -L 18300:127.0.0.1:8300 root@<host>
 # 然后浏览器打开 http://127.0.0.1:18300/panel
 ```
 

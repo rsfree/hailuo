@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import base64
+import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -151,3 +153,123 @@ def test_overview_counts(auth: TestClient) -> None:
     assert ov["accounts"]["total"] == 2
     assert ov["accounts"]["active"] == 2
     assert "pool_mode" in ov
+
+
+# ---------------------------------------------------------------- 观测面（第二期）
+
+def _seed(store) -> list[str]:
+    """造 2 成功 + 1 失败 —— 三条足够覆盖状态筛选、模型分组、失败原因聚类。"""
+    now = time.time()
+    for i in range(2):
+        store.create_task(
+            task_id=f"hailuo_ok{i}", credential_id="cred-a", owner_id="svc-a",
+            capability="hailuo-i2i", model="nano_banana21_flash",
+            status="succeeded", attempts=1,
+            request_json='{"prompt": "a cat"}',
+            result_json='{"images": [{"url": "http://x/1.png"}]}',
+            submitted_at=now - 30, finished_at=now)
+    store.create_task(
+        task_id="hailuo_bad0", credential_id="cred-a", owner_id="svc-b",
+        capability="hailuo-i2i", model="seedream-4.0",
+        status="failure", attempts=2,
+        request_json='{"prompt": "a dog"}',
+        error_json=json.dumps({"message": "upstream 401", "code": "unauthorized"}),
+        submitted_at=now - 10, finished_at=now)
+    return ["hailuo_ok0", "hailuo_ok1", "hailuo_bad0"]
+
+
+def test_observability_requires_login(panel: TestClient) -> None:
+    """观测面同样受会话保护 —— 它比账号列表更能看出业务全貌。"""
+    assert panel.get("/panel/api/tasks").status_code == 401
+    assert panel.get("/panel/api/usage").status_code == 401
+    assert panel.get("/panel/api/system").status_code == 401
+
+
+def test_tasks_list_and_filters(auth: TestClient, store) -> None:
+    _seed(store)
+    r = auth.get("/panel/api/tasks")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 3
+    assert len(body["items"]) == 3
+    # 列表行必须带错误摘要与耗时，但不带请求体（请求体只在详情里）
+    failed = [x for x in body["items"] if x["task_id"] == "hailuo_bad0"][0]
+    assert failed["error_brief"].startswith("upstream 401")
+    assert "request" not in failed
+    assert failed["duration"] >= 0
+
+    only_failed = auth.get("/panel/api/tasks", params={"status": "failure"}).json()
+    assert only_failed["total"] == 1
+    assert only_failed["items"][0]["task_id"] == "hailuo_bad0"
+
+    by_model = auth.get("/panel/api/tasks",
+                        params={"model": "seedream-4.0"}).json()
+    assert by_model["total"] == 1
+
+    by_q = auth.get("/panel/api/tasks", params={"q": "svc-b"}).json()
+    assert by_q["total"] == 1
+
+    paged = auth.get("/panel/api/tasks", params={"limit": 2, "offset": 2}).json()
+    assert paged["total"] == 3 and len(paged["items"]) == 1
+
+    assert body["facets"]["status"]["succeeded"] == 2
+    assert {m["model"] for m in body["facets"]["model"]} == {
+        "nano_banana21_flash", "seedream-4.0"}
+
+
+def test_task_detail_and_404(auth: TestClient, store) -> None:
+    _seed(store)
+    r = auth.get("/panel/api/tasks/hailuo_ok0")
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["request"]["prompt"] == "a cat"
+    assert task["result"]["images"][0]["url"] == "http://x/1.png"
+    assert auth.get("/panel/api/tasks/hailuo_missing").status_code == 404
+
+
+def test_usage_endpoint(auth: TestClient, store) -> None:
+    _seed(store)
+    r = auth.get("/panel/api/usage", params={"days": 7})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["daily"]) == 7
+    assert body["daily"][-1]["total"] == 3
+    assert body["latency"]["count"] == 2          # 只有成功任务参与耗时
+    assert body["latency"]["p50"] is not None
+    assert body["failed_reasons"][0]["reason"].startswith("upstream 401")
+
+
+def test_system_endpoint(auth: TestClient, store) -> None:
+    _seed(store)
+    r = auth.get("/panel/api/system")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["version"]
+    assert body["queue"] == 0
+    assert body["status"]["store"]["backend"] in {"sqlite", "postgresql"}
+
+
+def test_overview_reports_queue_and_today(auth: TestClient, store) -> None:
+    _seed(store)
+    body = auth.get("/panel/api/overview").json()
+    assert body["queue"] == 0
+    assert body["tasks"]["total"] == 3
+    assert "today_requests" in body and "active" in body
+
+
+def test_models_requires_login(panel: TestClient) -> None:
+    assert panel.get("/panel/api/models").status_code == 401
+
+
+def test_models_shape(auth: TestClient) -> None:
+    """模型页数据来自能力表，必须带单价与「刻意缺席」，否则运维看不到边界。"""
+    r = auth.get("/panel/api/models")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model_count"] >= 1
+    assert body["snapshot_date"]
+    first = body["models"][0]
+    for key in ("id", "name", "max_images", "resolutions", "aspect_ratios"):
+        assert key in first, key
+    assert isinstance(body["deliberate_absences"], dict)
+    assert body["deliberate_absences"], "缺席清单不该为空（它是边界的一部分）"

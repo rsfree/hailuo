@@ -30,6 +30,8 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from . import __version__ as _VERSION
+from . import models as models_mod
 from .accounts import (STATUS_ACTIVE, STATUS_DISABLED, AccountCipher,
                        AccountStore, make_prober)
 from .credentials import parse_jwt
@@ -162,6 +164,7 @@ def install_panel(app: FastAPI, *, settings: Any, service: Any,
     def me(request: Request) -> dict[str, Any]:
         guard(request)
         return {"ok": True, "pool_mode": bool(settings.service_keys),
+                "version": _VERSION,
                 "panel": {"ttl": SESSION_TTL}}
 
     # ------------------------------------------------------------------ 概览
@@ -174,12 +177,110 @@ def install_panel(app: FastAPI, *, settings: Any, service: Any,
             tasks = service.store.counts()   # type: ignore[attr-defined]
         except Exception as e:  # noqa: BLE001
             logger.debug(f"任务计数不可用（忽略）：{e}")
+        queue = active = 0
+        today_requests = 0
+        try:
+            store = service.store   # type: ignore[attr-defined]
+            queue = store.count_queued()
+            active = store.count_active()
+            today_requests = int(store.usage_series(days=1).get("total", 0))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"观测数据不可用（忽略）：{e}")
         return {
             "accounts": accounts.counts(),
             "pool_mode": bool(settings.service_keys),
             "encryption": cipher is not None,
             "service_keys": len(settings.service_keys or ()),
             "tasks": tasks,
+            "queue": queue,
+            "active": active,
+            "today_requests": today_requests,
+            "concurrency_limit": getattr(settings, "hl_concurrency", None),
+            "version": _VERSION,
+        }
+
+    # ------------------------------------------------------------------ 观测
+
+    @app.get("/panel/api/tasks", include_in_schema=False)
+    def list_tasks(request: Request, limit: int = 50, offset: int = 0,
+                   status: str = "", model: str = "", q: str = "",
+                   days: int = 0) -> dict[str, Any]:
+        """任务列表（分页 + 状态/模型/关键词/时间筛选）。`days=0` = 不限时间。"""
+        guard(request)
+        store = service.store   # type: ignore[attr-defined]
+        since = time.time() - days * 86400 if days > 0 else None
+        page = store.recent_tasks(limit=limit, offset=offset, status=status,
+                                  model=model, q=q, since=since)
+        return {**page, "facets": store.faceted_counts(since=since)}
+
+    @app.get("/panel/api/tasks/{task_id}", include_in_schema=False)
+    def task_detail(task_id: str, request: Request) -> dict[str, Any]:
+        """单任务全量（请求 / 计划 / 结果 / 错误 / 降级）。
+
+        这是面板里**唯一**会吐出请求体的接口 —— 它不是列表，误刷不会批量泄露。
+        """
+        guard(request)
+        rec = service.store.get_full(task_id)   # type: ignore[attr-defined]
+        if rec is None:
+            raise HTTPException(status_code=404, detail={
+                "error": {"message": "任务不存在", "code": "task_not_found"}})
+        return {"task": rec}
+
+    @app.get("/panel/api/models", include_in_schema=False)
+    def list_models(request: Request) -> dict[str, Any]:
+        """能力表：每个上游模型的档位/上限/单价，以及**刻意不做**的能力。
+
+        与公网 `/async/v1/models` 的区别：这里带单价、快照来源与缺席清单，
+        是给运维看的；那边是给调用方看的。
+        """
+        guard(request)
+        st = models_mod.status()
+        return {
+            **st,
+            "models": [m.to_public() for m in models_mod.all_models()],
+            "deliberate_absences": models_mod.DELIBERATE_ABSENCES,
+            "degradations": getattr(service, "capability_degradations", []),
+        }
+
+    @app.get("/panel/api/usage", include_in_schema=False)
+    def usage(request: Request, days: int = 7) -> dict[str, Any]:
+        """用量与质量：受理序列 / 任务序列 / 耗时分布 / 失败原因 Top N。"""
+        guard(request)
+        store = service.store   # type: ignore[attr-defined]
+        days = max(1, min(int(days), 90))
+        since = time.time() - days * 86400
+        return {
+            "usage": store.usage_series(days=days),
+            "daily": store.daily_series(days=days),
+            "latency": store.latency_summary(since=since),
+            "failed_reasons": store.failure_reasons(since=since),
+        }
+
+    @app.get("/panel/api/system", include_in_schema=False)
+    def system_status(request: Request) -> dict[str, Any]:
+        """运行状态：闸门、并发、协调器租约、存储、能力表快照。
+
+        复用 `/stats` 的同一份数据源，区别只是**这里要登录**（`/stats` 公网挡在入口层）。
+        """
+        guard(request)
+        svc = service
+        coord: dict[str, Any] = {}
+        try:
+            coord = request.app.state.coordinator.stats_view()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"协调器状态不可用（忽略）：{e}")
+        queue = active = 0
+        try:
+            queue = svc.store.count_queued()
+            active = svc.store.count_active()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"任务计数不可用（忽略）：{e}")
+        return {
+            "version": _VERSION,
+            "status": svc.status(),
+            "coordinator": coord,
+            "queue": queue,
+            "active": active,
         }
 
     # ------------------------------------------------------------------ 账号

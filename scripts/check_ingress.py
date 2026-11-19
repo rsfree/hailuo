@@ -4,15 +4,18 @@
 
 ## 为什么是脚本而不是清单
 
-规则是「**运维面在入口层 return 404，面板只走 SSH 隧道**」。写在文档里只是提醒，
+规则是「**除 `/panel` 外的运维面在入口层 return 404**」。写在文档里只是提醒，
 写成可执行判据才会在每次部署后真的被检查 —— 2026-11-17 就是因为没有这一步，
 面板被直接暴露在了公网。
 
+2026-11-19 口径变更：按用户要求（参考 workbuddy2api）**面板放开公网、口令即服务 Key**，
+因此 `/panel` 由 DENY 移入 ALLOW。`/stats`、`/docs`、`/redoc`、`/openapi.json` 仍必须 404。
+
 ## 判据
 
-- **必须 404**：`/panel*`、`/stats`、`/docs`、`/redoc`、`/openapi.json`
+- **必须 404**：`/stats`、`/docs`、`/redoc`、`/openapi.json`
   （自动文档同样属于运维面：它把完整参数面交给任何扫描器）；
-- **必须 200**：`/healthz`、`/readyz`、`/async/v1/models`；
+- **必须 200**：`/healthz`、`/readyz`、`/async/v1/models`、`/panel`；
 - 任一不符 ⇒ 退出码 1。
 
 用法：
@@ -29,9 +32,6 @@ import httpx
 
 #: 运维面：公网必须不可达（入口层 return 404）
 DENY = (
-    "/panel",
-    "/panel/api/accounts",
-    "/panel/app.js",
     "/stats",
     "/docs",
     "/redoc",
@@ -43,6 +43,7 @@ ALLOW = (
     "/healthz",
     "/readyz",
     "/async/v1/models",
+    "/panel",
 )
 
 
