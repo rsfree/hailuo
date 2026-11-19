@@ -378,6 +378,44 @@ class TaskStore:
             })
             return out
 
+    def get_view(self, task_id: str) -> dict[str, Any] | None:
+        """`view()` 需要的那几列 —— **不反序列化 `request_json` / `plan_json`**。
+
+        这两列存的是调用方原始请求与翻译结果：`image` 走 data URI 时，一份就是
+        几 MB 的 base64（`accept_form` 原样保留），而且请求与计划各存一份。
+        轮询端点与同步等待**每秒**都要读同一条任务，走 `get_full` 就等于为了看
+        一个 `status` 把整段 base64 解一遍 —— 代价与图片大小成正比，与需要的
+        信息量无关。
+
+        `plan.forecast_credits` 也不在这里读：成功收口时它已经写进 `result`
+        （`Service._apply_feeds`）。存量行没有那个键，`view()` 自己回退到 plan。
+        """
+        cols = (
+            self.row_cls.task_id,
+            self.row_cls.credential_id,
+            self.row_cls.owner_id,
+            self.row_cls.status,
+            self.row_cls.created_at,
+            self.row_cls.finished_at,
+            self.row_cls.result_json,
+            self.row_cls.error_json,
+        )
+        with self.session() as s:
+            row = s.execute(
+                select(*cols).where(self.row_cls.task_id == task_id)).first()
+            if row is None:
+                return None
+            return {
+                "task_id": row.task_id,
+                "credential_id": row.credential_id,
+                "owner_id": row.owner_id,
+                "status": row.status,
+                "created_at": row.created_at,
+                "finished_at": row.finished_at,
+                "result": json.loads(row.result_json) if row.result_json else None,
+                "error": json.loads(row.error_json) if row.error_json else None,
+            }
+
     def list_for_owner(self, owner_id: str, *, limit: int = 50) -> list[dict]:
         """只列**该调用方**的任务。
 

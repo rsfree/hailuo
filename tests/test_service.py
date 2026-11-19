@@ -904,6 +904,63 @@ def test_apply_feeds_all_failed_is_failure(service) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 轮询读取路径：只要状态，不反序列化请求原文
+# ---------------------------------------------------------------------------
+
+
+def test_poll_read_path_never_touches_the_request_blob(service, monkeypatch) -> None:
+    """轮询与同步等待每秒读一次同一条任务。
+
+    `image` 走 data URI 时，`request_json` / `plan_json` 各存一份几 MB 的 base64
+    （`accept_form` 原样保留）。为了看一个 `status` 把两份都反序列化，代价与
+    图片大小成正比、与需要的信息量无关。
+
+    咬住方式：把 `get_full` 换成一碰就炸 —— 轮询路径只要还走它，用例立即红。
+    """
+    rec = service.create({"prompt": "x"}, credential="c")
+
+    def _boom(*_a, **_k):
+        raise AssertionError("轮询路径不该调用 get_full：它会反序列化整段请求")
+
+    monkeypatch.setattr(service.store, "get_full", _boom)
+    light = service.get_for_view(rec["task_id"], None)
+    assert light["status"] == ST_QUEUED
+    assert "request" not in light and "plan" not in light
+    code, payload = view(light)
+    assert code == 202
+    assert payload["status"] == ST_QUEUED
+
+
+def test_light_view_agrees_with_full_view(service) -> None:
+    """两条读取路径对同一个终态任务必须给出**逐字段相同**的响应。
+
+    轻量路径漏一个 `view()` 依赖的字段，就是一个只在轮询时出现的 KeyError。
+    """
+    rec = service.create({"prompt": "x"}, credential="c")
+    assert service._apply_feeds(rec["task_id"], [_feed("f1", 2, "https://cdn/1.png")])
+    full = service.store.get_full(rec["task_id"])
+    light = service.get_for_view(rec["task_id"], None)
+    assert view(light) == view(full)
+
+
+def test_success_result_carries_forecast_credits(service) -> None:
+    """成功收口时把预估积分写进 result —— 轮询就不必回读 plan。
+
+    存量任务没有这个键，`view()` 仍回退到 plan（见响应形状段的老用例）。
+    """
+    rec = service.create({"prompt": "x"}, credential="c")
+    task_id = rec["task_id"]
+    forecast = service.store.get_full(task_id)["plan"]["forecast_credits"]
+    assert forecast is not None, "默认模型应能从计价表读到预估积分"
+
+    assert service._apply_feeds(task_id, [_feed("f1", 2, "https://cdn/1.png")])
+    light = service.get_for_view(task_id, None)
+    assert light["result"]["forecast_credits"] == forecast
+    _code, payload = view(light)
+    assert payload["usage"]["forecast_credits"] == forecast
+
+
+# ---------------------------------------------------------------------------
 # 响应形状（唯一出口）
 # ---------------------------------------------------------------------------
 

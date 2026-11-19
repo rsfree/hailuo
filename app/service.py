@@ -1388,6 +1388,11 @@ class Service:
             #: 调用方看到 succeeded 时 URL 就是最终形态，不存在"先 1K 后换链接"。
             payload = self._enhance_result(
                 task_id, full, success, self._success_payload(success))
+            #: 预估积分随产物一起落库：轮询出口走 `get_view`，只读 result ——
+            #: 不能为了一个数字去反序列化整份 plan（其中可能有几 MB 垫图 base64）。
+            forecast = (full.get("plan") or {}).get("forecast_credits")
+            if forecast is not None:
+                payload.setdefault("forecast_credits", forecast)
             self.store.update_task(
                 task_id, status=ST_SUCCEEDED,
                 **({"upstream_feed_id": primary.feed_id} if primary.feed_id else {}),
@@ -1489,6 +1494,18 @@ class Service:
 
     # ------------------------------------------------------------------ 查询
 
+    @staticmethod
+    def _assert_owner(rec: dict[str, Any], owner: str | None, task_id: str) -> None:
+        """归属校验：带 owner 时必须属于它；历史行按 `credential_id` 兜底。
+
+        抽成一处是为了让两条读取路径（全量 / 轻量）**不可能**在校验上分叉。
+        """
+        if owner is None:
+            return
+        task_owner = rec.get("owner_id") or rec.get("credential_id")
+        if task_owner != owner:
+            raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
+
     def get_for_credential(self, task_id: str,
                            owner: str | None) -> dict[str, Any]:
         """按 id 取任务。**带 Key 时必须属于该 Key**；不带 Key 放行（id 即凭据）。
@@ -1498,12 +1515,25 @@ class Service:
         full = self.store.get_full(task_id)
         if not full:
             raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
-        if owner is not None:
-            #: 历史行没有 owner_id ⇒ 按 credential_id 兜底（升级不丢任务）
-            task_owner = full.get("owner_id") or full.get("credential_id")
-            if task_owner != owner:
-                raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
+        self._assert_owner(full, owner, task_id)
         return full
+
+    def get_for_view(self, task_id: str,
+                     owner: str | None) -> dict[str, Any]:
+        """`view()` 用的**轻量**读取，归属规则与 `get_for_credential` 完全一致。
+
+        🔴 轮询端点与同步等待都走这里。两者每秒都要读同一条任务，而它们要的是
+        `status` / `result` / `error` —— 不是调用方原始请求。`get_full` 会把
+        `request_json` 与 `plan_json` 整段反序列化，`image` 走 data URI 时那是
+        两份几 MB 的 base64：同一个任务等 300 秒，等于把同一段 base64 解上千遍。
+
+        要请求原文（重放、面板详情）仍走 `get_for_credential`。
+        """
+        rec = self.store.get_view(task_id)
+        if not rec:
+            raise TaskNotFoundError(f"任务 {task_id} 不存在，或不属于当前 API Key。")
+        self._assert_owner(rec, owner, task_id)
+        return rec
 
     def wait_terminal(self, task_id: str, credential: str, *,
                       max_wait: float) -> dict[str, Any]:
@@ -1524,14 +1554,15 @@ class Service:
         t0 = time.monotonic()
         deadline = t0 + max_wait
         while True:
-            full = self.get_for_credential(task_id, credential)
+            #: 轻量读：这里每 0.5s 看一次状态，不该把请求中的 base64 重解一遍。
+            rec = self.get_for_view(task_id, credential)
             remaining = deadline - time.monotonic()
-            if full["status"] in TERMINAL or remaining <= 0:
+            if rec["status"] in TERMINAL or remaining <= 0:
                 OBS.event("sync.wait_finished", task_id=task_id,
-                          status=full["status"],
+                          status=rec["status"],
                           waited_s=round(time.monotonic() - t0, 3),
-                          timed_out=full["status"] not in TERMINAL)
-                return full
+                          timed_out=rec["status"] not in TERMINAL)
+                return rec
             time.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
 
     def list_for_credential(self, owner: str, *, limit: int = 50) -> dict[str, Any]:
@@ -1609,8 +1640,11 @@ def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         result = record.get("result") or {}
         data = result.get("data") or []
         usage: dict[str, Any] = {"images": result.get("images", len(data))}
-        plan = record.get("plan") or {}
-        forecast = plan.get("forecast_credits")
+        #: 优先读 result：轮询走 `get_view`，不反序列化 plan。存量任务收口时
+        #: 还没写这个键 ⇒ 回退到 plan（那条路径的成本只落在老任务上）。
+        forecast = result.get("forecast_credits")
+        if forecast is None:
+            forecast = (record.get("plan") or {}).get("forecast_credits")
         if forecast is not None:
             #: 🔴 明说是**预估**：来自上游计价表，不是账单实扣值。
             usage["forecast_credits"] = forecast

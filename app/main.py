@@ -402,7 +402,9 @@ def _install_routes(app: FastAPI) -> None:
         · 不存在 / 不属于本 Key → **404**（**本地拦，不发上游请求**）。
         """
         svc: Service = request.app.state.service
-        rec = svc.get_for_credential(task_id, caller.owner_id if caller else None)
+        #: 轮询走轻量读取：只要 status / result / error，不反序列化请求原文
+        #: （`image` 走 data URI 时那几 MB 的 base64 与这次查询无关）。
+        rec = svc.get_for_view(task_id, caller.owner_id if caller else None)
         status_code, payload = view(rec)
         return JSONResponse(status_code=status_code, content=payload)
 
