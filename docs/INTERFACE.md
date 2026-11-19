@@ -79,7 +79,7 @@ Content-Type: application/json
 | `reference_mode` | 否 | 上游 `referenceMode`。**默认不发送**（与抓包一致） |
 | `seed` | 否 | 整数（上游未声明该字段，传了会被忽略并留痕） |
 | `negative_prompt` | 否 | 上游未声明该字段，传了会被忽略并留痕 |
-| `response_format` | 否 | **异步只认 `url`**（等价于不传）。显式 `b64_json` ⇒ `400`，其它值 ⇒ `400`。拒绝发生在**建任务之前**：零成本、可修 |
+| `response_format` | 否 | **恒交付 URL**（上游只回链接、本服务不转存字节）。`url` 零留痕；`b64_json` 与非法取值**降级为 url 并留痕** —— OpenAI 兼容客户端普遍默认传 `b64_json`，拒掉会让整类客户端一条都发不出来 |
 
 ### `image` 是数组，张数上限**按所选模型自己声明的**
 
@@ -119,9 +119,12 @@ Content-Type: application/json
 
 ### 关于「认得但做不到」的字段
 
-出现 `watermark` / `response_format` / `style` / `stream` / `user` /
-`sequential_image_generation` / `max_images` / `background` / `output_format` /
-`moderation` 时**不报错**，而是进 `degradations`（见 §5）。其它未知字段 → `400`。
+出现 `watermark` / `style` / `stream` / `user` / `sequential_image_generation` /
+`max_images` / `background` / `output_format` / `moderation` 时**不报错**，
+而是进 `degradations`（见 §5）。其它未知字段 → `400`。
+
+⚠️ `response_format` **不在这一档**：它不是"上游没有"，而是"我们要的就是 url" ——
+所以它是被**正常处理**的（见 §1 字段表），留痕只针对 `b64_json` 这个无法满足的要求。
 
 这条区分的判据是：**这是"上游没有"还是"你写错了"？**
 两者的修复动作完全不同 —— 把两者都塞进"不支持"，会让人去查上游能力表，
@@ -146,6 +149,9 @@ GET /async/v1/images/generations/{task_id}
 - `created` 是**受理时间**，全阶段不变（出图时刻不是任务的属性）。
 - `id` 与 `task_id` **同值**，只为"按 `id` 解析"的老客户端保留。新接入请用 `task_id`。
 - 成功与失败都在这个壳上追加字段，**壳本身不动** —— 客户端可以按一张类型读到底。
+- **`data[]` 里永远只有 `url`。** 传 `response_format: "b64_json"` 不会报错，但实际交付仍是
+  链接（留痕到任务库 `degradations_json`）—— 上游只回链接，本服务不转存字节，
+  所以不存在"有时给 b64"的分支。同步与异步同一条规则。
 
 ### 2.1 非终态 → `202`
 

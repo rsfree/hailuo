@@ -362,19 +362,17 @@ def test_pending_task_is_a_task_object(client) -> None:
     assert isinstance(body["created"], int) and body["created"] > 0
 
 
-def test_async_rejects_b64_delivery_without_creating_task(client, store) -> None:
-    """异步只交付 URL：`b64_json` 在**建任务之前**就拒 —— 零成本、可修。
+def test_async_b64_request_falls_back_to_url(client) -> None:
+    """`b64_json` **不报错，降级为 url 交付**。
 
-    静默改成 url 等于"收下就丢"：调用方以为拿到 base64，实际拿到链接，
-    而且已经为这次生成付过费。
+    OpenAI 兼容客户端普遍把 `b64_json` 当默认值传；拒掉会让整类客户端一条都发不出来，
+    而它们拿到 `url` 同样能展示。代价（调用方拿不到 base64）落在 degradations 里 ——
+    接口响应与同步路径一字不差，两条路径行为必须一致。
     """
-    before = store.stats().get("total", 0)
     r = client.post("/async/v1/images/generations",
                     json={"prompt": "x", "response_format": "b64_json"}, headers=KEY)
-    assert r.status_code == 400
-    assert r.json()["error"]["code"] == "invalid_parameter"
-    assert r.json()["error"]["param"] == "response_format"
-    assert store.stats().get("total", 0) == before, "拒绝必须发生在落库之前"
+    assert r.status_code == 202
+    assert "task_id" in r.json()
 
 
 def test_async_accepts_explicit_url_format(client) -> None:
@@ -384,8 +382,25 @@ def test_async_accepts_explicit_url_format(client) -> None:
     assert r.status_code == 202
 
 
-def test_async_rejects_unknown_response_format(client) -> None:
+def test_unknown_response_format_is_normalised_to_url(client) -> None:
+    """非法取值同样归一到 url —— 归一化一处登记，两条路径共用。"""
     r = client.post("/async/v1/images/generations",
                     json={"prompt": "x", "response_format": "webp"}, headers=KEY)
-    assert r.status_code == 400
-    assert r.json()["error"]["param"] == "response_format"
+    assert r.status_code == 202
+
+
+def test_b64_fallback_is_traced_in_task_row(client, store) -> None:
+    """降级必须在任务行里留痕 —— 这是"收下就丢"唯一的补偿。
+
+    调用方拿到的是 url 而不是它要的 base64；没有留痕，这个落差在任何地方
+    都查不到，只能靠人复现请求才知道。
+    """
+    r = client.post("/async/v1/images/generations",
+                    json={"prompt": "x", "response_format": "b64_json"}, headers=KEY)
+    assert r.status_code == 202
+    task_id = r.json()["task_id"]
+    full = store.get_full(task_id)
+    notes = full.get("degradations") or []
+    assert any("b64_json" in n for n in notes), notes
+    # 留痕要写明**实际交付什么**，不能只说"不支持"
+    assert any("url" in n for n in notes), notes

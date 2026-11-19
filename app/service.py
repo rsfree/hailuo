@@ -198,7 +198,6 @@ class Plan:
 
 KNOWN_UNSUPPORTED: dict[str, str] = {
     "watermark": "上游图片链路没有水印开关（产物本身就带不带水印两版直链）",
-    "response_format": "上游恒回 URL（不回 b64_json）",
     "style": "上游没有 style 维度（画面风格请写进 prompt）",
     "stream": "本服务是两段式异步接口，没有流式",
     "user": "上游没有 user 维度",
@@ -610,46 +609,18 @@ class Service:
 
     # ------------------------------------------------------------------ 受理
 
-    @staticmethod
-    def _reject_inline_carrier(request: dict[str, Any]) -> None:
-        """异步路径在**预扣之前**拒绝内联交付形态。
-
-        为什么是硬拒而不是静默改成 `url`：静默改写等于"收下就丢" ——
-        调用方以为拿到了 base64，实际拿到链接，且已经为这次生成付过费。
-        拒绝发生在建任务之前，零成本、可修。
-
-        为什么单位是单张而不是批量：`data[]` 里每一项都是几 MB，
-        而这张任务表同时是队列和账本，行膨胀会拖垮列表、轮询与备份。
-        """
-        raw = request.get("response_format")
-        if raw is None:
-            return
-        value = str(raw).strip().lower()
-        if value == "url":
-            return
-        if value == "b64_json":
-            raise InvalidParameterError(
-                "异步任务只交付 URL：response_format='b64_json' 不被支持。"
-                "产物要写进任务行并被任意次轮询读取 —— 内联 base64 会让每次轮询"
-                "重传整张图。请改用 response_format='url'，或不传（默认即 url）。",
-                param="response_format")
-        raise InvalidParameterError(
-            f"response_format 只能是 'url'，实得 {value!r}。", param="response_format")
-
     def create(self, body: dict[str, Any], *, credential: str,
                owner: str | None = None, quota: int = 0,
-               label: str = "", async_mode: bool = False) -> dict[str, Any]:
+               label: str = "") -> dict[str, Any]:
         """受理一次生成。**只落库，零上游往返。**
 
         `owner` 是**任务归属**（可见性）；不传则等于 `credential`（透传模式的旧行为）。
 
-        `async_mode` 只影响**交付形态**的裁决：异步任务的结果要落库并被反复轮询，
-        所以 b64 在创建时就拒掉（见 `_reject_inline_carrier`）。同步响应发完即弃，
-        不受此限 —— 同一个 `build_plan` 服务两条路径，差异只在这里。
+        ⚠️ 同步与异步**共用这一条受理链路**，交付形态也在 `build_plan` 里统一裁决。
+        两条路径的行为必须一致 —— 同一个客户端换个端点就得到不同结果，
+        是比"多返回一个字段"严重得多的契约缺陷。
         """
         request = dict(body or {})
-        if async_mode:
-            self._reject_inline_carrier(request)
         plan, capability, upstream_model = self.build_plan(request)
         #: 配额在**校验通过之后**才扣：写错参数的请求不该吃掉额度。
         self._consume_quota(owner or credential, quota, label=label)
@@ -690,7 +661,8 @@ class Service:
 
         # ---- 未知字段：区分"上游没有"与"你写错了"
         known = {"model", "prompt", "image", "size", "n", "seed", "negative_prompt",
-                 "resolution", "aspect_ratio", "quality", "reference_mode"}
+                 "resolution", "aspect_ratio", "quality", "reference_mode",
+                 "response_format"}
         for key in request:
             if key in known:
                 continue
@@ -702,6 +674,25 @@ class Service:
             raise InvalidParameterError(
                 f"未知参数 {key!r}。本服务接受的字段：{', '.join(sorted(known))}。",
                 param=key)
+
+        # ---- 交付形态
+        #: `response_format` **不能**归进"上游没有的字段"：我们要的正是 url。
+        #: 把它当"不转发、已忽略"留痕，等于告诉调用方"你的要求没被理会"——
+        #: 而事实是我们逐字满足它。这类假留痕比不留痕更坏：它教人忽略真留痕。
+        rf = request.get("response_format")
+        if rf is not None:
+            rf_value = str(rf).strip().lower()
+            if rf_value == "url":
+                pass                      # 交付形态本来就是 url，零留痕
+            elif rf_value == "b64_json":
+                #: 上游恒回 URL ⇒ 归一到 url 并留痕。**同步与异步同一条规则**。
+                degradations.append(
+                    "response_format='b64_json' 无法满足：上游只回 URL，"
+                    "产物将以 url 交付（不是 base64）。")
+            else:
+                degradations.append(
+                    f"response_format={rf!r} 不是合法取值（只有 url / b64_json）"
+                    f"⇒ 已归一到 url。")
 
         # ---- 输入图
         image_urls = media.accept_form(request.get("image"))
