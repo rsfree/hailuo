@@ -6,7 +6,7 @@ hailuo（`hailuoai.video`）的**异步**出口，两条链路同进程、互不
 
 ```
 POST   /async/v1/images/generations        → 202 {"task_id": "hailuo_…"}   只回一个 id
-GET    /async/v1/images/generations/{id}   → 202 排队态 / 200 {data,created,usage}
+GET    /async/v1/images/generations/{id}   → 202 排队态 / 200 终态（任务对象，成功带 status）
 GET    /async/v1/images/generations        → 本 Key 的任务列表
 DELETE /async/v1/images/generations/{id}   → 删除**已终态**的任务
 GET    /async/v1/models                    → 图片能力清单 + 上游模型注册表
@@ -208,9 +208,10 @@ curl -s -X POST localhost:8300/async/v1/images/generations \
 
 curl -s localhost:8300/async/v1/images/generations/hailuo_… \
   -H 'Authorization: Bearer <你的 hailuo token>'
-# → 非终态：202 {"task_id":"…","status":"in_progress"}
-# → 成功  ：200 {"data":[{"url":"https://cdn.hailuoai.video/…png"}],
-#                "created":1789923012,"usage":{"images":1,"forecast_credits":8}}
+# → 非终态：202 {"task_id":"…","id":"…","created":1789922960,"status":"in_progress"}
+# → 成功  ：200 {"task_id":"…","id":"…","created":1789922960,"status":"succeeded",
+#                "data":[{"url":"https://cdn.hailuoai.video/…png"}],
+#                "usage":{"images":1,"forecast_credits":8}}
 ```
 
 要点：

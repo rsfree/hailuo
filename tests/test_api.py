@@ -91,11 +91,17 @@ def test_get_success_returns_data_created_usage(client, service, fake) -> None:
     r = client.get(f"/async/v1/images/generations/{task_id}", headers=KEY)
     assert r.status_code == 200
     body = r.json()
-    # 契约三件套必须齐；降级说明**不进响应**（2026-10-10 起只进日志与任务库）
-    assert set(body) == {"data", "created", "usage"}
+    #: 异步终态是**任务对象**：`status` 判终止、`data` 直接当同步结果用。
+    #: 成功必须带 status —— 否则客户端只能靠"有没有 data"判结束，
+    #: 而"成功但产物为空"时会永远等下去。
+    assert set(body) == {"task_id", "id", "created", "status", "data", "usage"}
+    assert body["status"] == "succeeded"
+    assert body["id"] == body["task_id"] == task_id
     assert body["data"][0]["url"].startswith("https://")
     assert isinstance(body["created"], int) and body["created"] > 0
     assert body["usage"]["images"] == 1
+    # 降级说明**不进响应**（2026-10-10 起只进日志与任务库）
+    assert "degradations" not in body
 
 
 def test_get_without_key_is_allowed(client) -> None:
@@ -337,3 +343,49 @@ def test_sync_endpoint_202_falls_back_to_async(client, service, monkeypatch) -> 
     assert set(body) == {"task_id", "status"}
     assert body["status"] == ST_QUEUED
     assert r.headers["Location"] == f"/async/v1/images/generations/{body['task_id']}"
+
+
+# ---------------------------------------------------------------------------
+# 异步端点：任务对象形状与载体交付形态
+# ---------------------------------------------------------------------------
+
+
+def test_pending_task_is_a_task_object(client) -> None:
+    """非终态也是任务对象：`id` 与 `task_id` 同值（老客户端按 id 解析）。"""
+    task_id = _accept(client, {"prompt": "x"})
+    r = client.get(f"/async/v1/images/generations/{task_id}")
+    assert r.status_code == 202
+    body = r.json()
+    assert set(body) == {"task_id", "id", "created", "status"}
+    assert body["task_id"] == body["id"] == task_id
+    assert body["status"] == ST_QUEUED
+    assert isinstance(body["created"], int) and body["created"] > 0
+
+
+def test_async_rejects_b64_delivery_without_creating_task(client, store) -> None:
+    """异步只交付 URL：`b64_json` 在**建任务之前**就拒 —— 零成本、可修。
+
+    静默改成 url 等于"收下就丢"：调用方以为拿到 base64，实际拿到链接，
+    而且已经为这次生成付过费。
+    """
+    before = store.stats().get("total", 0)
+    r = client.post("/async/v1/images/generations",
+                    json={"prompt": "x", "response_format": "b64_json"}, headers=KEY)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_parameter"
+    assert r.json()["error"]["param"] == "response_format"
+    assert store.stats().get("total", 0) == before, "拒绝必须发生在落库之前"
+
+
+def test_async_accepts_explicit_url_format(client) -> None:
+    """显式 `url` 与不传等价 —— 异步的唯一天然形态。"""
+    r = client.post("/async/v1/images/generations",
+                    json={"prompt": "x", "response_format": "url"}, headers=KEY)
+    assert r.status_code == 202
+
+
+def test_async_rejects_unknown_response_format(client) -> None:
+    r = client.post("/async/v1/images/generations",
+                    json={"prompt": "x", "response_format": "webp"}, headers=KEY)
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "response_format"

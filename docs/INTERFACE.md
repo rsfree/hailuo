@@ -79,6 +79,7 @@ Content-Type: application/json
 | `reference_mode` | 否 | 上游 `referenceMode`。**默认不发送**（与抓包一致） |
 | `seed` | 否 | 整数（上游未声明该字段，传了会被忽略并留痕） |
 | `negative_prompt` | 否 | 上游未声明该字段，传了会被忽略并留痕 |
+| `response_format` | 否 | **异步只认 `url`**（等价于不传）。显式 `b64_json` ⇒ `400`，其它值 ⇒ `400`。拒绝发生在**建任务之前**：零成本、可修 |
 
 ### `image` 是数组，张数上限**按所选模型自己声明的**
 
@@ -136,10 +137,20 @@ GET /async/v1/images/generations/{task_id}
 
 **不需要 Authorization**（见 §2.4）。
 
+### 2.0 任务对象（所有阶段同一个壳）
+
+```json
+{ "task_id": "hailuo_...", "id": "hailuo_...", "created": 1789922960, "status": "queued" }
+```
+
+- `created` 是**受理时间**，全阶段不变（出图时刻不是任务的属性）。
+- `id` 与 `task_id` **同值**，只为"按 `id` 解析"的老客户端保留。新接入请用 `task_id`。
+- 成功与失败都在这个壳上追加字段，**壳本身不动** —— 客户端可以按一张类型读到底。
+
 ### 2.1 非终态 → `202`
 
 ```json
-{ "task_id": "hailuo_...", "status": "queued" }
+{ "task_id": "hailuo_...", "id": "hailuo_...", "created": 1789922960, "status": "queued" }
 ```
 
 `status ∈ {queued, in_progress}`。**202 的意思是"还没好，继续轮询"** ——
@@ -149,11 +160,18 @@ GET /async/v1/images/generations/{task_id}
 
 ```json
 {
+  "task_id": "hailuo_...",
+  "id": "hailuo_...",
+  "created": 1789922960,
+  "status": "succeeded",
   "data": [ { "url": "https://cdn.hailuoai.video/moss/…/xxx.png" } ],
-  "created": 1789923012,
   "usage": { "images": 1, "forecast_credits": 8 }
 }
 ```
+
+🔴 **成功也必须带 `status`**（`succeeded`）。客户端按 `status` 判终止，
+而不是按"有没有 `data`" —— 后者在"成功但产物为空"时会永远等下去。
+判据与失败态共用同一个词表：`queued` / `in_progress` / `succeeded` / `failure`。
 
 三条刻意的取舍：
 
@@ -171,6 +189,8 @@ GET /async/v1/images/generations/{task_id}
 ```json
 {
   "task_id": "hailuo_...",
+  "id": "hailuo_...",
+  "created": 1789922960,
   "status": "failure",
   "error": { "message": "...", "type": "...", "code": "..." }
 }

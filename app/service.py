@@ -610,14 +610,46 @@ class Service:
 
     # ------------------------------------------------------------------ 受理
 
+    @staticmethod
+    def _reject_inline_carrier(request: dict[str, Any]) -> None:
+        """异步路径在**预扣之前**拒绝内联交付形态。
+
+        为什么是硬拒而不是静默改成 `url`：静默改写等于"收下就丢" ——
+        调用方以为拿到了 base64，实际拿到链接，且已经为这次生成付过费。
+        拒绝发生在建任务之前，零成本、可修。
+
+        为什么单位是单张而不是批量：`data[]` 里每一项都是几 MB，
+        而这张任务表同时是队列和账本，行膨胀会拖垮列表、轮询与备份。
+        """
+        raw = request.get("response_format")
+        if raw is None:
+            return
+        value = str(raw).strip().lower()
+        if value == "url":
+            return
+        if value == "b64_json":
+            raise InvalidParameterError(
+                "异步任务只交付 URL：response_format='b64_json' 不被支持。"
+                "产物要写进任务行并被任意次轮询读取 —— 内联 base64 会让每次轮询"
+                "重传整张图。请改用 response_format='url'，或不传（默认即 url）。",
+                param="response_format")
+        raise InvalidParameterError(
+            f"response_format 只能是 'url'，实得 {value!r}。", param="response_format")
+
     def create(self, body: dict[str, Any], *, credential: str,
                owner: str | None = None, quota: int = 0,
-               label: str = "") -> dict[str, Any]:
+               label: str = "", async_mode: bool = False) -> dict[str, Any]:
         """受理一次生成。**只落库，零上游往返。**
 
         `owner` 是**任务归属**（可见性）；不传则等于 `credential`（透传模式的旧行为）。
+
+        `async_mode` 只影响**交付形态**的裁决：异步任务的结果要落库并被反复轮询，
+        所以 b64 在创建时就拒掉（见 `_reject_inline_carrier`）。同步响应发完即弃，
+        不受此限 —— 同一个 `build_plan` 服务两条路径，差异只在这里。
         """
         request = dict(body or {})
+        if async_mode:
+            self._reject_inline_carrier(request)
         plan, capability, upstream_model = self.build_plan(request)
         #: 配额在**校验通过之后**才扣：写错参数的请求不该吃掉额度。
         self._consume_quota(owner or credential, quota, label=label)
@@ -1644,27 +1676,38 @@ class Service:
 # ---------------------------------------------------------------------------
 
 
-def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+def view(record: dict[str, Any], *, sync: bool = False) -> tuple[int, dict[str, Any]]:
     """任务记录 → `(HTTP 状态码, 响应体)`。**唯一出口。**
 
-    · 非终态 → **202** + `{task_id, status}`（调用方据此继续轮询）；
-    · 成功 → **200** + `{data: [{url}], created, usage}`；
-    · 失败 → **200** + `{task_id, status: "failure", error}`；
-      · ⚠️ 例外：**内容违规（content_policy_violation）→ 451**（2026-10-15
-        用户口径）——调用方必须一眼可辨且**不可重试**。
+    🔴 **两条路径是两套响应契约，不是一个壳子加不加字段。**
+
+    · **轮询**（`sync=False`，默认）—— 任务对象 §3.2：
+      `{task_id, id, created, status}` + 终态附 `data`/`usage`/`error`。
+      非终态 **202**、终态 **200**。**成功也带 `status`** —— 客户端按 status
+      判终止，而不是按"有没有 data"：后者在"成功但产物为空"时会永远等下去。
+    · **同步**（`sync=True`）—— 生成响应 §0.2：
+      成功只出 `{created, data, usage}`，**不带 `task_id`/`status`** ——
+      同步的终止信号是 HTTP 200 本身，多给一个 status 就是在教客户端写第二套判据。
+
+    `created` 的语义按各自契约走：
+      轮询 = **任务受理时间**（对象生命周期属性，全阶段不变）；
+      同步 = **上游出图时间**（就是这次生成的结果时间戳）。
+    把两者统一会逼着调用方按阶段猜语义，那比两个字段更糟。
 
     ⚠️ **失败也回 200**：任务本身完成了（只是结果是失败），请求没出错。
-    回 4xx 会误触发调用方的重试逻辑。451 是唯一例外。
-
-    降级说明**不出现在响应里**（2026-10-10 接口字段收敛）：留痕只进
-    **服务日志**（受理时 `降级留痕：…` / 提交时 `归一化留痕：…`，带 task_id）
-    与任务库 `degradations_json` —— 调用方（newapi 号池）不消费该字段。
+    回 4xx 会误触发调用方的重试逻辑。451 是唯一例外（内容违规，不可重试）。
     """
     task_id = record["task_id"]
     status = record["status"]
+    created_at = int(record.get("created_at") or 0)
 
     if status not in TERMINAL:
-        return 202, {"task_id": task_id, "status": status}
+        if sync:
+            #: 同步预算耗尽 ⇒ **无缝降级为异步轮询**：必须给 task_id 与 status，
+            #: 但 `id`/`created` 是任务对象的外壳，同步路径不引入。
+            return 202, {"task_id": task_id, "status": status}
+        return 202, {"task_id": task_id, "id": task_id,
+                     "created": created_at, "status": status}
 
     if status == ST_SUCCEEDED:
         result = record.get("result") or {}
@@ -1678,21 +1721,34 @@ def view(record: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if forecast is not None:
             #: 🔴 明说是**预估**：来自上游计价表，不是账单实扣值。
             usage["forecast_credits"] = forecast
+        payload = [{"url": d["url"]} for d in data]
+        if sync:
+            return 200, {
+                "data": payload,
+                "created": int(result.get("created")
+                               or record.get("finished_at") or created_at),
+                "usage": usage,
+            }
         return 200, {
-            "data": [{"url": d["url"]} for d in data],
-            "created": int(result.get("created") or record.get("finished_at") or 0),
-            "usage": usage,
+            "task_id": task_id, "id": task_id, "created": created_at,
+            "status": ST_SUCCEEDED, "data": payload, "usage": usage,
         }
 
     error = record.get("error") or {
         "message": "任务失败（上游未给出原因）。", "type": "upstream_error",
         "code": "task_failed",
     }
+    if sync:
+        failure: dict[str, Any] = {"task_id": task_id, "status": ST_FAILURE,
+                                   "error": error}
+    else:
+        failure = {"task_id": task_id, "id": task_id, "created": created_at,
+                   "status": ST_FAILURE, "error": error}
     if error.get("code") == "content_policy_violation":
         #: 🔴 内容违规（2026-10-15 用户口径）：**451** 代替 200+failure ——
         #: 调用方一眼可辨且不该重试；其余失败仍 200（避免误触发重试逻辑）。
-        return 451, {"task_id": task_id, "status": "failure", "error": error}
-    return 200, {"task_id": task_id, "status": "failure", "error": error}
+        return 451, failure
+    return 200, failure
 
 
 # ---------------------------------------------------------------------------

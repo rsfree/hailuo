@@ -323,7 +323,9 @@ def _install_routes(app: FastAPI) -> None:
         svc: Service = request.app.state.service
         rec = svc.create(body.model_dump(), credential=caller.credential_id,
                          owner=caller.owner_id, quota=caller.quota,
-                         label=caller.label)
+                         label=caller.label,
+                         #: 异步交付只出 URL：b64 在**建任务之前**拒掉（零成本、可修）。
+                         async_mode=True)
         # 叫醒协调器：不然这条任务要等到下一个 tick 才被发现（默认最多白等 1s）。
         request.app.state.coordinator.wake()
         return JSONResponse(
@@ -380,7 +382,7 @@ def _install_routes(app: FastAPI) -> None:
                                     max_wait=settings.sync_max_wait)
         finally:
             slots.release()
-        status_code, payload = view(rec)
+        status_code, payload = view(rec, sync=True)
         headers: dict[str, str] = {}
         if status_code == 202:
             #: 预算耗尽 ⇒ 把异步轮询的入口直接递给调用方（无缝降级）
