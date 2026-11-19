@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,9 @@ from .credentials import parse_jwt
 from .errors import AdapterError
 
 COOKIE = "hl_panel"
+#: 别名读-改-写的串行化。单 worker 但 FastAPI 把同步端点丢线程池执行，
+#: 两个面板标签页同时保存会互相覆盖 —— 锁的代价远低于"配置莫名少一条"。
+_ALIAS_LOCK = threading.Lock()
 SESSION_TTL = 12 * 3600
 _ASSETS = Path(__file__).resolve().parent / "panel"
 
@@ -64,6 +69,13 @@ class ImportBody(BaseModel):
 
 class StatusBody(BaseModel):
     status: str
+
+
+class AliasBody(BaseModel):
+    """一条「客户端请求名 → 上游模型」映射。"""
+
+    alias: str
+    target: str
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +253,113 @@ def install_panel(app: FastAPI, *, settings: Any, service: Any,
             "deliberate_absences": models_mod.DELIBERATE_ABSENCES,
             "degradations": getattr(service, "capability_degradations", []),
         }
+
+    # -------------------------------------------------------------- 模型别名
+
+    def _alias_snapshot() -> dict[str, Any]:
+        """别名全量视图：运行期 + 内置，逐条标来源与是否被遮蔽。"""
+        builtin = dict(models_mod.MODEL_ALIASES)
+        runtime = models_mod.runtime_aliases()
+        items = []
+        for alias in sorted(set(builtin) | set(runtime)):
+            if alias in runtime:
+                items.append({"alias": alias, "target": runtime[alias],
+                              "source": "runtime",
+                              "shadowed": alias in builtin})
+            else:
+                items.append({"alias": alias, "target": builtin[alias],
+                              "source": "builtin", "shadowed": False})
+        return {
+            "items": items,
+            "builtin": builtin,
+            "runtime": runtime,
+            "targets": [m.model_id for m in models_mod.all_models()],
+            "reserved": sorted(
+                [c.name for c in models_mod.CAPABILITIES]
+                + [a for c in models_mod.CAPABILITIES for a in c.aliases]),
+            "meta_key": models_mod.ALIASES_META_KEY,
+        }
+
+    @app.get("/panel/api/aliases", include_in_schema=False)
+    def list_aliases(request: Request) -> dict[str, Any]:
+        """模型别名：`{客户端请求名: 上游 modelID}`。"""
+        guard(request)
+        return _alias_snapshot()
+
+    @app.post("/panel/api/aliases", include_in_schema=False)
+    def put_alias(body: AliasBody, request: Request) -> dict[str, Any]:
+        """新增或改写一条别名。校验在**写入前**完成，失败不留半条配置。"""
+        guard(request)
+        alias = (body.alias or "").strip()
+        target = (body.target or "").strip()
+
+        if not alias:
+            raise HTTPException(400, detail={"error": {
+                "message": "客户端请求名不能为空。", "code": "invalid_alias"}})
+        if len(alias) > 64:
+            raise HTTPException(400, detail={"error": {
+                "message": f"客户端请求名最长 64 字符，实得 {len(alias)}。",
+                "code": "invalid_alias"}})
+        if any(ch.isspace() for ch in alias) or any(ord(ch) < 32 for ch in alias):
+            raise HTTPException(400, detail={"error": {
+                "message": f"客户端请求名不能含空白或控制字符：{alias!r}。",
+                "code": "invalid_alias"}})
+
+        #: 🔴 能力名/能力别名**不能**当别名 —— `resolve_capability` 先于模型解析执行，
+        #: 配了也永远不会命中，属于"静默无效配置"，必须在写入时挡掉。
+        reserved = {c.name.lower() for c in models_mod.CAPABILITIES}
+        reserved |= {a.lower() for c in models_mod.CAPABILITIES for a in c.aliases}
+        if alias.lower() in reserved:
+            raise HTTPException(400, detail={"error": {
+                "message": f"{alias!r} 是能力名/能力别名（决定图生图还是文生图路由），"
+                           f"不能用作模型别名 —— 配了也不会生效。",
+                "code": "alias_reserved"}})
+
+        #: 同值判断放在"目标是否存在"**之前**：`same → same` 的问题是"没有信息量"，
+        #: 与目标在不在能力表无关；先报 unknown_target 会把人引向错误的修法。
+        if target == alias:
+            raise HTTPException(400, detail={"error": {
+                "message": f"目标与请求名相同（{alias!r}），这条映射没有意义。",
+                "code": "alias_identity"}})
+
+        known = {m.model_id for m in models_mod.all_models()}
+        if target not in known:
+            raise HTTPException(400, detail={"error": {
+                "message": f"目标模型 {target!r} 不在当前能力表里。"
+                           f"可用：{', '.join(sorted(known))}。",
+                "code": "unknown_target"}})
+
+        store = service.store   # type: ignore[attr-defined]
+        with _ALIAS_LOCK:
+            current = models_mod.runtime_aliases()
+            current[alias] = target
+            store.set_meta(models_mod.ALIASES_META_KEY,
+                           json.dumps(current, ensure_ascii=False, sort_keys=True))
+            models_mod.install_runtime_aliases(current)
+        logger.info(f"面板设置别名 {alias!r} → {target}")
+        return {"ok": True, **_alias_snapshot()}
+
+    @app.delete("/panel/api/aliases/{alias}", include_in_schema=False)
+    def drop_alias(alias: str, request: Request) -> dict[str, Any]:
+        """删除一条**运行期**别名（内置条目不可删，只会回落到内置值）。"""
+        guard(request)
+        store = service.store   # type: ignore[attr-defined]
+        with _ALIAS_LOCK:
+            current = models_mod.runtime_aliases()
+            if alias not in current:
+                if alias in models_mod.MODEL_ALIASES:
+                    raise HTTPException(400, detail={"error": {
+                        "message": f"{alias!r} 是**内置**别名（写死在 app/models.py），"
+                                   f"面板不能删。要改语义请给它配一条同名别名覆盖。",
+                        "code": "alias_builtin"}})
+                raise HTTPException(404, detail={"error": {
+                    "message": f"没有运行期别名 {alias!r}。", "code": "alias_not_found"}})
+            del current[alias]
+            store.set_meta(models_mod.ALIASES_META_KEY,
+                           json.dumps(current, ensure_ascii=False, sort_keys=True))
+            models_mod.install_runtime_aliases(current)
+        logger.info(f"面板删除别名 {alias!r}")
+        return {"ok": True, **_alias_snapshot()}
 
     @app.get("/panel/api/usage", include_in_schema=False)
     def usage(request: Request, days: int = 7) -> dict[str, Any]:

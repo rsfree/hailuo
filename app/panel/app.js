@@ -18,6 +18,7 @@ const state = {
   system: null,
   models: null,
   modelQ: "",
+  aliases: null,
   timer: null,
 };
 
@@ -465,6 +466,67 @@ function renderUsage(data) {
   }
 }
 
+/* ---------------------------------------------------------------- 别名 */
+
+function renderAliases(data) {
+  state.aliases = data;
+
+  const sel = $("#alias-target");
+  const keep = sel.value;
+  sel.textContent = "";
+  for (const t of data.targets || []) {
+    const o = el("option", "", t);
+    o.value = t;
+    sel.appendChild(o);
+  }
+  if (keep && (data.targets || []).includes(keep)) sel.value = keep;
+
+  const items = data.items || [];
+  const tbody = $("#aliasTable tbody");
+  tbody.textContent = "";
+  $("#aliasEmpty").hidden = items.length > 0;
+
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    tr.appendChild(el("td", "mono nowrap", it.alias));
+    const tdT = el("td", "mono ellip", it.target);
+    tdT.title = it.target;
+    tr.appendChild(tdT);
+
+    const tdSrc = el("td");
+    tdSrc.appendChild(it.source === "runtime"
+      ? el("span", "tag accent", "面板配置")
+      : el("span", "tag mute", "内置"));
+    if (it.shadowed) tdSrc.appendChild(el("span", "tag warn", "覆盖内置"));
+    tr.appendChild(tdSrc);
+
+    const tdOp = el("td", "right");
+    if (it.source === "runtime") {
+      const b = el("button", "btn sm ghost", "删除");
+      b.type = "button";
+      b.addEventListener("click", () => dropAlias(it.alias));
+      tdOp.appendChild(b);
+    } else {
+      tdOp.appendChild(el("span", "hint", "—"));
+    }
+    tr.appendChild(tdOp);
+    tbody.appendChild(tr);
+  }
+}
+
+async function loadAliases() {
+  const r = await api("/panel/api/aliases");
+  renderAliases(r);
+}
+
+async function dropAlias(alias) {
+  if (!window.confirm(`删除别名「${alias}」？\n\n删除后该名称会回落到内置写法（若存在），或变成未知 model。`)) return;
+  try {
+    const r = await api(`/panel/api/aliases/${encodeURIComponent(alias)}`, { method: "DELETE" });
+    renderAliases(r);
+  } catch (e) { flash(e.message); }
+}
+
 /* ---------------------------------------------------------------- 模型 */
 
 function renderModels(data) {
@@ -639,9 +701,12 @@ async function refresh() {
     if (!state.overview) state.overview = await api("/panel/api/overview");
     updateModeTag();
   } else if (v === "models") {
-    const [r, ov] = await Promise.all([api("/panel/api/models"), api("/panel/api/overview")]);
+    const [r, ov, al] = await Promise.all([
+      api("/panel/api/models"), api("/panel/api/overview"), api("/panel/api/aliases"),
+    ]);
     state.overview = ov;
     renderModels(r);
+    renderAliases(al);
     updateModeTag();
   } else if (v === "system") {
     const [r, ov] = await Promise.all([api("/panel/api/system"), api("/panel/api/overview")]);
@@ -800,6 +865,20 @@ $("#taskPrev").addEventListener("click", () => {
 $("#taskNext").addEventListener("click", () => {
   state.tasks.offset += state.tasks.limit;
   refresh().catch((e) => flash(e.message));
+});
+
+$("#alias-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const alias = $("#alias-name").value.trim();
+  const target = $("#alias-target").value;
+  if (!alias || !target) return;
+  try {
+    const r = await api("/panel/api/aliases", {
+      method: "POST", body: JSON.stringify({ alias, target }),
+    });
+    $("#alias-name").value = "";
+    renderAliases(r);
+  } catch (e) { flash(e.message); }
 });
 
 $("#modelQ").addEventListener("input", (ev) => {

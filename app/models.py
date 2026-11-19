@@ -30,6 +30,9 @@ from .errors import InvalidParameterError
 #: 快照日期。**改 `FROZEN_SNAPSHOT` 必须同步改它** —— 它是"数据有多旧"的唯一线索。
 SNAPSHOT_DATE = "2026-09-21"
 
+#: 运行期别名在任务库 `meta` 表里的键名（面板写、启动读，同一个键）。
+ALIASES_META_KEY = "model_aliases"
+
 
 # ---------------------------------------------------------------------------
 # 能力（本服务对外宣告的 model 取值）
@@ -353,14 +356,60 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 
+#: 🔴 **运行期别名层**（面板可配，2026-11-19）。语义与 `MODEL_ALIASES` 完全一致，
+#: 唯一的差别是**谁说了算**：这里优先。
+#:
+#: 为什么单独一层而不是改 `MODEL_ALIASES`：
+#:   · 内置表是**代码常量**，删配置要能自动回落到它（"恢复出厂"）；
+#:   · 运行期表来自任务库，进程重启后由 `Service` 重新装入 —— 常量表不能承担这个角色。
+#:
+#: 并发模型：整体替换引用（copy-on-write），读侧无锁。本服务是**单 worker 架构**
+#: （`gunicorn_conf.py` 的架构约束），面板写入后立即生效，不存在跨进程可见性问题。
+_RUNTIME_ALIASES: dict[str, str] = {}
+
+
+def install_runtime_aliases(mapping: dict[str, str] | None) -> None:
+    """整体替换运行期别名表（面板写入后调用；`None`/空 = 清空，回落内置）。"""
+    global _RUNTIME_ALIASES
+    _RUNTIME_ALIASES = {str(k): str(v) for k, v in (mapping or {}).items()}
+
+
+def runtime_aliases() -> dict[str, str]:
+    return dict(_RUNTIME_ALIASES)
+
+
+def effective_aliases() -> dict[str, str]:
+    """生效别名全量视图：内置打底，运行期覆盖。**面板展示与错误提示都用它。**"""
+    merged = dict(MODEL_ALIASES)
+    merged.update(_RUNTIME_ALIASES)
+    return merged
+
+
+def is_known_model_name(raw: str) -> bool:
+    """`raw` 是否是调用方可以用作 `model` 的模型名（上游 key 或任一别名）。
+
+    能力名/能力别名**不在**这里判 —— 那是 `resolve_capability` 的职责。
+    """
+    if not raw:
+        return False
+    if raw in _RUNTIME_ALIASES or raw in MODEL_ALIASES:
+        return True
+    return any(m.model_id == raw for m in all_models())
+
+
 def canonical_model_id(raw: str) -> str:
     """别名 → 规范 upstream modelID（非别名原样返回）。
 
     🔴 `gpt-image*` 前缀**一律定向** `GPT_IMAGE_CANONICAL`（成本策略，
     2026-10-15）—— 精确拼法（gpt-image-2.5-flare）原样通过。
+
+    解析顺序：**运行期别名（面板配置）→ 内置常量 → 原样返回**。
+    运行期表在前，是为了让运营配置能覆盖内置拼法；删掉配置即自动回落。
     """
     if raw.startswith(GPT_IMAGE_PREFIX) and raw != GPT_IMAGE_CANONICAL:
         return GPT_IMAGE_CANONICAL
+    if raw in _RUNTIME_ALIASES:
+        return _RUNTIME_ALIASES[raw]
     return MODEL_ALIASES.get(raw, raw)
 
 
@@ -389,7 +438,7 @@ def resolve_capability(value: str | None, *, has_image: bool) -> tuple[str, list
         #: 即使运行期清单波动也不把 gpt-image* 判成未知模型。
         return ("hailuo-i2i" if has_image else "hailuo-t2i"), []
     known = {m.model_id for m in all_models()}
-    if raw in known or raw in MODEL_ALIASES:
+    if raw in known or raw in MODEL_ALIASES or raw in _RUNTIME_ALIASES:
         # 上游模型 key（或其别名）：**原样透传，零映射、零说明**。
         # 调用方给的就是模型本身（的另一种拼法）⇒ 不存在"翻译"，更没有降级 ——
         # 能力名只是内部校验路由（prompt/输入图校验用），不出现在上游请求里。
@@ -400,7 +449,7 @@ def resolve_capability(value: str | None, *, has_image: bool) -> tuple[str, list
         f"未知 model={raw!r}。可用能力："
         f"{', '.join(c.name for c in CAPABILITIES)}；"
         f"或直接传上游模型 key（如 {DEFAULT_MODEL}）；"
-        f"别名可用：{', '.join(sorted(MODEL_ALIASES))}。",
+        f"别名可用：{', '.join(sorted(effective_aliases()))}。",
         param="model",
     )
 
@@ -468,6 +517,7 @@ def status() -> dict[str, Any]:
 
 
 __all__ = [
+    "ALIASES_META_KEY",
     "CAPABILITIES",
     "DEFAULT_MODEL",
     "DELIBERATE_ABSENCES",
@@ -483,6 +533,10 @@ __all__ = [
     "all_models",
     "canonical_model_id",
     "capability",
+    "effective_aliases",
+    "install_runtime_aliases",
+    "is_known_model_name",
+    "runtime_aliases",
     "catalog",
     "get_model",
     "install_runtime_models",

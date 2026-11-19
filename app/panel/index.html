@@ -244,6 +244,35 @@ window.addEventListener("error", function (e) {
           </div>
         </div>
 
+        <div class="box">
+          <div class="box-h">
+            <h3>模型别名</h3>
+            <span class="hint" style="margin-left:10px">客户端请求名 → 上游模型，改完立即生效</span>
+            <div class="grow"></div>
+            <form id="alias-form" class="row" autocomplete="off">
+              <input id="alias-name" type="text" placeholder="客户端请求名" maxlength="64" required style="width:170px">
+              <select id="alias-target" style="width:210px"></select>
+              <button class="btn sm primary" type="submit">保存</button>
+            </form>
+          </div>
+          <div class="box-b tight">
+            <div class="tbl-wrap">
+              <table id="aliasTable">
+                <thead><tr>
+                  <th>客户端请求名</th><th>→ 上游模型</th><th>来源</th>
+                  <th class="right">操作</th>
+                </tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="empty" id="aliasEmpty" hidden>还没有别名。</div>
+            <p class="hint" style="padding:0 15px 12px">
+              区分大小写（与上游 modelID 口径一致）；能力名（<code>hailuo-i2i</code> 等）不能当请求名。
+              删除运行期条目会<strong>回落</strong>到内置写法，内置条目只能覆盖不能删。
+            </p>
+          </div>
+        </div>
+
         <div class="grid2">
           <div class="box">
             <div class="box-h"><h3>刻意缺席</h3></div>
@@ -290,6 +319,6 @@ window.addEventListener("error", function (e) {
   </div>
 </div>
 
-<script src="/panel/app.js?v=2"></script>
+<script src="/panel/app.js?v=3"></script>
 </body>
 </html>

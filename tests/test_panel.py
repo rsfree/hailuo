@@ -273,3 +273,120 @@ def test_models_shape(auth: TestClient) -> None:
         assert key in first, key
     assert isinstance(body["deliberate_absences"], dict)
     assert body["deliberate_absences"], "缺席清单不该为空（它是边界的一部分）"
+
+
+# ---------------------------------------------------------------------------
+# 模型别名（客户端请求名 → 上游 modelID）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_aliases():
+    """运行期别名是**模块级**状态：每个用例前后清空，避免串味。
+
+    真实现里它由任务库驱动、单 worker 持有；测试里不清理会让
+    `canonical_model_id` 的其它断言看到别的用例留下的映射。
+    """
+    from app import models as models_mod
+
+    models_mod.install_runtime_aliases({})
+    yield
+    models_mod.install_runtime_aliases({})
+
+
+def test_aliases_require_login(panel: TestClient) -> None:
+    assert panel.get("/panel/api/aliases").status_code == 401
+    assert panel.post("/panel/api/aliases",
+                      json={"alias": "x", "target": "nano-banana2"}).status_code == 401
+
+
+def test_aliases_shape(auth: TestClient) -> None:
+    """内置别名必须可见 —— 运维要能区分"我配的"和"代码里写死的"。"""
+    body = auth.get("/panel/api/aliases").json()
+    assert body["items"], "内置别名不该为空"
+    builtin = [i for i in body["items"] if i["source"] == "builtin"]
+    assert builtin, "至少要有内置别名"
+    assert any(i["alias"] == "nano-banana-pro" for i in builtin)
+    assert body["targets"], "目标候选不能为空（否则面板没法选）"
+    assert "hailuo-i2i" in body["reserved"]
+
+
+def test_create_alias_takes_effect_immediately(auth: TestClient) -> None:
+    """核心判据：面板配一条，**不重启**就改变 `model` 的解析结果。"""
+    from app import models as models_mod
+
+    target = models_mod.all_models()[0].model_id
+    r = auth.post("/panel/api/aliases", json={"alias": "my-fast-model", "target": target})
+    assert r.status_code == 200, r.text
+    assert models_mod.canonical_model_id("my-fast-model") == target
+
+    body = r.json()
+    mine = [i for i in body["items"] if i["alias"] == "my-fast-model"]
+    assert mine and mine[0]["source"] == "runtime"
+
+    # 受理链路也认它：不再报"未知 model"
+    cap, notes = models_mod.resolve_capability("my-fast-model", has_image=False)
+    assert cap == "hailuo-t2i" and notes == []
+
+
+def test_alias_persists_across_service_restart(auth: TestClient, settings, store) -> None:
+    """重启后仍生效 —— 配置在库里，不是内存。"""
+    from app import models as models_mod
+    from app.service import Service
+
+    target = models_mod.all_models()[0].model_id
+    assert auth.post("/panel/api/aliases",
+                     json={"alias": "persisted", "target": target}).status_code == 200
+
+    models_mod.install_runtime_aliases({})            # 模拟进程重启：内存清空
+    assert models_mod.canonical_model_id("persisted") == "persisted"
+
+    fresh = Service(settings, store=store, fetch_capabilities=False)
+    try:
+        assert models_mod.canonical_model_id("persisted") == target
+    finally:
+        fresh.close()
+
+
+def test_alias_can_shadow_builtin_then_fall_back(auth: TestClient) -> None:
+    """覆盖内置别名后删掉 ⇒ 回落到内置值（"恢复出厂"）。"""
+    from app import models as models_mod
+
+    target = models_mod.all_models()[0].model_id
+    r = auth.post("/panel/api/aliases", json={"alias": "nano-banana-pro", "target": target})
+    assert r.status_code == 200
+    assert models_mod.canonical_model_id("nano-banana-pro") == target
+    shadowed = [i for i in r.json()["items"] if i["alias"] == "nano-banana-pro"][0]
+    assert shadowed["source"] == "runtime" and shadowed["shadowed"] is True
+
+    assert auth.delete("/panel/api/aliases/nano-banana-pro").status_code == 200
+    assert models_mod.canonical_model_id("nano-banana-pro") == "nano-banana2"
+
+
+@pytest.mark.parametrize("alias,target,code", [
+    ("", "nano-banana2", "invalid_alias"),
+    ("a" * 65, "nano-banana2", "invalid_alias"),
+    ("has space", "nano-banana2", "invalid_alias"),
+    ("hailuo-i2i", "nano-banana2", "alias_reserved"),
+    ("i2i", "nano-banana2", "alias_reserved"),
+    ("图生图", "nano-banana2", "alias_reserved"),
+    ("ok-name", "not-a-real-model", "unknown_target"),
+    ("same", "same", "alias_identity"),
+])
+def test_alias_rejects_bad_input(auth: TestClient, alias, target, code) -> None:
+    """凡是"配了也不会生效"或"指向不存在的模型"，都在**写入前**挡掉。"""
+    r = auth.post("/panel/api/aliases", json={"alias": alias, "target": target})
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"]["error"]["code"] == code
+
+
+def test_delete_builtin_alias_is_refused(auth: TestClient) -> None:
+    """内置别名删不掉（它写死在 models.py），只能覆盖 —— 必须明说。"""
+    r = auth.delete("/panel/api/aliases/nano-banana-pro")
+    assert r.status_code == 400
+    assert r.json()["detail"]["error"]["code"] == "alias_builtin"
+
+
+def test_delete_unknown_alias_is_404(auth: TestClient) -> None:
+    r = auth.delete("/panel/api/aliases/never-existed")
+    assert r.status_code == 404

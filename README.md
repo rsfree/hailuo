@@ -41,6 +41,7 @@ GET    /v1/models                                → OpenAI 形态清单（图�
 | 接视频链路（Seedance 协议） | `docs/SEEDANCE.md` |
 | **改 `yy` 签名** | `app/upstream/hailuo/sign.py`（**5 条抓包向量自证**） |
 | 改"图片能用什么 / 默认模型" | `app/models.py`（唯一的能力注册表） |
+| 给客户端加模型别名（请求名 → 上游模型） | 面板「模型 → 模型别名」；落 `meta.model_aliases`，运行期优先于 `MODEL_ALIASES` |
 | 改图片请求翻译（`size`/`n`/图片张数） | `app/service.py::build_plan`（**纯函数，重点覆盖**） |
 | 改"视频能用什么 / 首尾帧怎么落" | `app/upstream/hailuo/video_models.py`（族 + 三个槽位） |
 | 改视频请求翻译（`content[]` → 计划） | `app/video_service.py::build_video_plan`（**纯函数**） |
@@ -308,6 +309,13 @@ curl -s localhost:8300/panel                        # 浏览器打开即可
 | 批量导入 | `POST /panel/api/accounts/import`（每行 `备注<Tab>token` 或裸 token） |
 | 巡检（单个 / 全部） | `POST /panel/api/accounts/{id}/check` · `.../check_all` |
 | 概览 | `GET /panel/api/overview` |
+| 模型别名（查 / 增改 / 删） | `GET/POST /panel/api/aliases` · `DELETE /panel/api/aliases/{alias}` |
+
+**模型别名**（`客户端请求名 → 上游 modelID`）：面板「模型 → 模型别名」配置，
+落任务库 `meta.model_aliases`（JSON），**改完立即生效**（模块级 copy-on-write，单 worker）。
+优先级 **运行期 > 内置 `MODEL_ALIASES` > 原样透传**；删除运行期条目即自动回落内置值。
+两条硬校验：目标是能力表里真实存在的 modelID；请求名不能是能力名/能力别名
+（那会先于模型解析决定图生图/文生图路由，配了也不命中）。
 
 **入口鉴权两条路，判据是 token 形态**（细节见 `app/poolauth.py`）：
 

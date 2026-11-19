@@ -267,6 +267,36 @@ class Service:
         self._secret = self.store.fingerprint_secret()
         if fetch_capabilities:
             self.refresh_capabilities()
+        #: 运行期模型别名（面板可配）：**启动即装入**，否则重启后自定义拼法会失效。
+        self.reload_model_aliases()
+
+    # ------------------------------------------------------------------ 别名
+
+    def reload_model_aliases(self) -> dict[str, str]:
+        """从任务库读运行期模型别名并装入 `models` 模块。
+
+        🔴 读失败**不抛**：别名是运营配置，缺了只影响自定义拼法，
+        内置 `MODEL_ALIASES` 仍兜住既有调用方 —— 让"面板配置读坏"
+        升级成"服务起不来"是把影响面放大了一个数量级。
+        """
+        stored = models.runtime_aliases()
+        try:
+            raw = self.store.get_meta(models.ALIASES_META_KEY) or ""
+            mapping = json.loads(raw) if raw.strip() else {}
+            if not isinstance(mapping, dict):
+                raise ValueError(
+                    f"{models.ALIASES_META_KEY} 应为 JSON 对象，实得 {type(mapping).__name__}")
+            clean = {str(k).strip(): str(v).strip() for k, v in mapping.items()}
+            clean = {k: v for k, v in clean.items() if k and v}
+            models.install_runtime_aliases(clean)
+            if clean:
+                logger.info(f"已装入 {len(clean)} 条运行期模型别名")
+            return clean
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"运行期模型别名读取失败，沿用上一份（{len(stored)} 条）："
+                f"{type(e).__name__}: {e}")
+            return stored
 
     # ------------------------------------------------------------------ 依赖
 
