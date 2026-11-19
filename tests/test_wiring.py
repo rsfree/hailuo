@@ -750,3 +750,18 @@ def test_multi_account_gate_cooldown_is_per_account(service, fake) -> None:
     assert len(fake.create_calls) == 1
     assert service.gate_for("acct-a").in_cooldown
     assert not service.gate_for("acct-b").in_cooldown
+
+
+def test_video_service_shares_credentials_and_account_pool(client) -> None:
+    """视频是**另一个 Service 实例**，凭据池与号池引用必须共用。
+
+    分开的池会让「提交时登记、协调器执行时查找」永远落空：任务在建任务阶段
+    直接死在 `credential_unavailable`（2026-11-19 一条真实视频任务的失败原因）。
+    号池引用不注入则 `_rehydrate` 无法从库里的密文恢复凭据，重启后同样失败。
+    """
+    app = client.app
+    assert app.state.video_service.credentials is app.state.service.credentials, \
+        "视频协调器必须查提交时写入的那个池"
+    assert app.state.video_service.accounts is app.state.accounts, \
+        "视频服务必须能按指纹从号池自愈"
+    assert app.state.video_service.account_cipher is app.state.cipher

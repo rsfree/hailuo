@@ -223,6 +223,13 @@ def create_app(settings: Settings | None = None,
     #: 让 Service 能把上游失败**回灌号池**（只影响下次选号，见 note_account_failure）。
     service.accounts = accounts
     service.account_cipher = cipher
+    #: 视频是**另一个 Service 实例**。凭据池与号池引用必须与图片服务共用：
+    #: 提交时登记的凭据落在 `service.credentials`，视频协调器若查自己的空池，
+    #: 建任务阶段就会 `credential_unavailable`（2026-11-19 实测一条真实任务失败）；
+    #: 而 `_rehydrate` 依赖 `accounts`，不注入则池空时永远无法从号池自愈。
+    video_service.credentials = service.credentials
+    video_service.accounts = accounts
+    video_service.account_cipher = cipher
     app.state.accounts = accounts
     app.state.cipher = cipher
     app.state.pool_auth = PoolAuth(settings=settings, service=service,
