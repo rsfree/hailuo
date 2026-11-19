@@ -605,6 +605,13 @@ function renderSystem(data) {
 
 async function refresh() {
   const v = state.view;
+  if (!state.version) {
+    // 登录路径（先 401 后登录）不会经过 boot 的 me 分支 —— 版本号在这里补一次
+    try {
+      const me = await api("/panel/api/me");
+      state.version = me.version || "";
+    } catch (_e) { /* 忽略：版本号只是展示 */ }
+  }
   if (v === "accounts") {
     const [ov, list] = await Promise.all([api("/panel/api/overview"), api("/panel/api/accounts")]);
     state.overview = ov;
